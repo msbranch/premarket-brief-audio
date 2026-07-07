@@ -1,0 +1,52 @@
+name: The Tape Read — Audio
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_id:
+        description: "Ghost post ID of the published brief (24-hex id from Ghost admin / the post's API id)."
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run — generate the script + MP3 as artifacts, but do NOT upload or patch Ghost."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tape-read-audio-${{ github.event.inputs.post_id }}
+  cancel-in-progress: false
+
+jobs:
+  audio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate narration + attach audio
+        env:
+          POST_ID:             ${{ github.event.inputs.post_id }}
+          DRY_RUN:             ${{ github.event.inputs.dry_run }}
+          GHOST_ADMIN_API_URL: ${{ secrets.GHOST_ADMIN_API_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          ELEVENLABS_API_KEY:  ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+        run: python3 scripts/generate_audio.py
+
+      - name: Upload script + MP3 artifact (dry-run / debugging)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tape-read-audio
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 7
