@@ -108,7 +108,8 @@ def html_to_text(html: str) -> str:
 def generate_script(anthropic_key, brief_text, date_str):
     body = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 2000,
+        "max_tokens": 3000,   # headroom for the ~1100-word target + mandatory closing line;
+                              # stays under the 9500-char TTS cap even at worst-case token density.
         "system": SCRIPT_SYSTEM.replace("{date}", date_str),
         "messages": [{"role": "user", "content":
             f"Here is today's written brief. Convert it into the spoken narration per the rules.\n\n{brief_text}"}],
@@ -119,6 +120,10 @@ def generate_script(anthropic_key, brief_text, date_str):
     script = "".join(parts).strip()
     if not script:
         raise RuntimeError("Anthropic returned an empty script")
+    if data.get("stop_reason") == "max_tokens":
+        # Hit the ceiling -> the script is truncated mid-sentence and the closing line is missing.
+        # Fail loudly rather than synthesize a cut-off MP3 (and never patch a live post with it).
+        raise RuntimeError("Anthropic hit max_tokens — script was truncated; raise max_tokens or tighten the length target")
     return script
 
 
