@@ -110,8 +110,9 @@ def html_to_text(html: str) -> str:
 def generate_script(anthropic_key, brief_text, date_str):
     body = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 3000,   # headroom for the ~1100-word target + mandatory closing line;
-                              # stays under the 9500-char TTS cap even at worst-case token density.
+        "max_tokens": 4096,   # headroom for the ~1100-word target (spelling every ticker as a company
+                              # name runs longer) + the mandatory closing line. A completed script still
+                              # lands under the 9500-char TTS cap; the guard below backstops the rest.
         "system": SCRIPT_SYSTEM.replace("{date}", date_str),
         "messages": [{"role": "user", "content":
             f"Here is today's written brief. Convert it into the spoken narration per the rules.\n\n{brief_text}"}],
