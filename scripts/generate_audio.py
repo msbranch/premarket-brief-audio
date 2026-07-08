@@ -48,6 +48,8 @@ HARD RULES:
 Say company names ("Robinhood," "Nvidia," "the semiconductor complex"), and speak numbers the way a person \
 would ("up about four and a quarter percent," "a put/call ratio near point four," "roughly twenty-three \
 million dollars of net call premium"). Spell out abbreviations.
+- Spell EVERY ticker as its company name, EVERYWHERE including the scorecard and flow sections — "SpaceX" not \
+"SPCX," "Robinhood" not "HOOD." Never voice a raw ticker as letters.
 - Target 900 to 1100 words, about six to seven minutes spoken. This is the FULLER companion to the written \
 brief, not a teaser — include the substance, leave nothing important on the floor.
 - COVERAGE: give EACH watchlist name its full reasoning — the flow read, what the skew says, the technical \
