@@ -15,8 +15,9 @@ Tick `dry_run` to generate the script + MP3 as a downloadable artifact without p
 2. Converts the written brief into a ~3–4 minute spoken narration (Anthropic, Sonnet 5).
 3. Synthesizes an MP3 (ElevenLabs).
 4. Uploads the MP3 to Ghost's own media store → public CDN URL.
-5. Patches the post: audio player at the top. On paid posts a Ghost paywall divider sits
-   **after** the player, so the audio is public for everyone while the text stays gated.
+5. Patches the post with the audio player. On paid posts the player sits **inside** the
+   paywalled region (same access as the brief), so it's members-only. On public posts it's
+   at the top for everyone.
 
 Idempotent — re-running on the same post is a safe no-op (it detects the existing player).
 

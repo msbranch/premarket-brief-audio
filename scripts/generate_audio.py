@@ -10,9 +10,10 @@ Sequence:
   2. Convert the written brief -> spoken-word narration via the Anthropic API.
   3. Synthesize an MP3 via ElevenLabs TTS.
   4. Upload the MP3 to Ghost's own media store (/media/upload/) -> public CDN URL.
-  5. Patch the post: prepend an audio player card at the top. On PAID posts,
-     insert a Ghost paywall divider AFTER the card so the audio sits in the
-     public-preview region (audio free for everyone; text stays gated).
+  5. Patch the post with an audio player card. On PAID/members posts the card goes
+     INSIDE the gated region (just after the post's paywall divider, or at the top of
+     an already-fully-gated body) so the audio is members-only — same access as the
+     brief. On public posts it's simply prepended.
 
 Idempotent: if the post already carries the audio card (id="tape-read-audio"),
 it exits 0 without re-patching.
@@ -179,8 +180,16 @@ def build_new_html(original_html, mp3_url, visibility):
     card = audio_card(mp3_url)
     if visibility == "public":
         return card + "\n" + original_html                    # Monday: everything already public
-    # Paid/members: audio in the public preview, then the paywall, then the gated brief.
-    return card + "\n<!--members-only-->\n" + original_html
+    # Paid/members: the audio is paid content too — same access as the brief, never in the public
+    # preview. If the post has a public-preview (paywall) divider, drop the card just AFTER it so it
+    # sits at the top of the gated region. Otherwise the whole paid body is already gated, so the card
+    # goes at the top and inherits that gating.
+    marker = "<!--members-only-->"
+    idx = original_html.find(marker)
+    if idx != -1:
+        cut = idx + len(marker)
+        return original_html[:cut] + "\n" + card + "\n" + original_html[cut:]
+    return card + "\n" + original_html
 
 
 def patch_post(api_url, admin_key, post_id, updated_at, new_html):
