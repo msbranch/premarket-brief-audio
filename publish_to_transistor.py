@@ -2,11 +2,12 @@
 """Publish the generated Tape Read MP3 to Transistor.fm as a podcast episode.
 
 Runs AFTER generate_audio.py has produced the MP3 and patched Ghost. Publishing
-is three sequential Transistor API calls:
+is four sequential Transistor API calls:
 
-  1. GET  /v1/episodes/authorize_upload  -> a pre-signed S3 upload URL + audio_url key
-  2. PUT  {upload_url}                    -> the raw MP3 bytes (URL is already authenticated)
-  3. POST /v1/episodes                    -> create the (published) episode record
+  1. GET   /v1/episodes/authorize_upload  -> a pre-signed S3 upload URL + audio_url key
+  2. PUT   {upload_url}                    -> the raw MP3 bytes (URL is already authenticated)
+  3. POST  /v1/episodes                    -> create the episode (created as a draft)
+  4. PATCH /v1/episodes/{id}/publish       -> publish it (status=published)
 
 CLI:
   --audio-file  path to the MP3 (required)
@@ -101,6 +102,8 @@ def main():
         f"The Tape Read — Pre-Market Intelligence Brief for {args.date}. "
         f"Full written brief (paid subscribers): {args.ghost_url} | thetaperead.morganbranch.co"
     )
+    # POST /v1/episodes creates a DRAFT — it does not accept `status`. Publishing is a
+    # separate call (below).
     payload = {
         "episode": {
             "show_id": show_id,
@@ -108,7 +111,6 @@ def main():
             "summary": args.summary,
             "description": description,
             "audio_url": audio_url,
-            "status": "published",
             "explicit": "false",
         }
     }
@@ -121,7 +123,17 @@ def main():
     check(r3, "create episode")
     data = r3.json()["data"]
     episode_id = data["id"]
-    share_url = data["attributes"]["share_url"]
+    print(f"created draft episode {episode_id}")
+
+    # --- Call 4: publish the episode (status transitions live on a dedicated endpoint) --
+    r4 = requests.patch(
+        f"{API_BASE}/episodes/{episode_id}/publish",
+        headers={"x-api-key": api_key, "Content-Type": "application/json"},
+        data=json.dumps({"episode": {"status": "published"}}),
+        timeout=60,
+    )
+    check(r4, "publish episode")
+    share_url = r4.json()["data"]["attributes"].get("share_url") or data["attributes"].get("share_url", "")
     print(f"published episode {episode_id}: {share_url}")
 
     # --- expose results to the workflow --------------------------------------
