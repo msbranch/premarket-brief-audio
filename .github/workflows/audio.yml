@@ -6,8 +6,8 @@
 #   ANTHROPIC_API_KEY         — Anthropic API key
 #   ELEVENLABS_API_KEY        — ElevenLabs API key
 #   ELEVENLABS_VOICE_ID       — ElevenLabs voice id
-#   BUZZSPROUT_PODCAST_ID     — Buzzsprout podcast ID (dashboard URL: buzzsprout.com/XXXXXX)
-#   BUZZSPROUT_API_TOKEN      — Buzzsprout API token (dashboard → API Access tab)
+#   TRANSISTOR_API_KEY        — Transistor.fm API key (Account settings → API Key)
+#   TRANSISTOR_SHOW_ID        — Transistor.fm show ID (numeric ID in dashboard URL)
 
 name: The Tape Read — Audio
 
@@ -53,34 +53,30 @@ jobs:
           ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
         run: python3 scripts/generate_audio.py
 
-      - name: Install requests
-        run: pip install requests
-
-      - name: Publish to Buzzsprout podcast feed
-        id: publish_buzzsprout
+      - name: Publish to Transistor.fm podcast feed
+        id: publish_transistor
         if: ${{ github.event.inputs.dry_run != 'true' }}
         env:
-          BUZZSPROUT_PODCAST_ID: ${{ secrets.BUZZSPROUT_PODCAST_ID }}
-          BUZZSPROUT_API_TOKEN: ${{ secrets.BUZZSPROUT_API_TOKEN }}
+          TRANSISTOR_API_KEY: ${{ secrets.TRANSISTOR_API_KEY }}
+          TRANSISTOR_SHOW_ID: ${{ secrets.TRANSISTOR_SHOW_ID }}
         run: |
-          SUMMARY=$(cat out/episode_summary.txt 2>/dev/null || echo "Pre-market intelligence brief.")
-          GHOST_URL=$(cat out/episode_url.txt 2>/dev/null || echo "https://thetaperead.morganbranch.co")
-          TITLE=$(cat out/episode_title.txt 2>/dev/null || echo "The Tape Read")
-          DATE=$(cat out/episode_date.txt 2>/dev/null || echo "")
-          MP3=$(cat out/episode_mp3_path.txt 2>/dev/null || echo "")
-          python3 publish_to_buzzsprout.py \
-            --audio-file "$MP3" \
-            --title "$TITLE" \
-            --date "$DATE" \
-            --summary "$SUMMARY" \
-            --ghost-url "$GHOST_URL"
+          if [ ! -f out/episode_mp3_path.txt ]; then
+            echo "No episode metadata found (audio step produced no new MP3 — e.g. idempotent skip). Nothing to publish to Transistor."
+            exit 0
+          fi
+          pip install --quiet requests
+          python3 publish_to_transistor.py \
+            --audio-file "$(cat out/episode_mp3_path.txt)" \
+            --title "$(cat out/episode_title.txt)" \
+            --date "$(cat out/episode_date.txt)" \
+            --summary "$(cat out/episode_summary.txt)" \
+            --ghost-url "$(cat out/episode_url.txt)"
 
       - name: Publish summary
-        if: ${{ steps.publish_buzzsprout.outputs.buzzsprout_audio_url != '' }}
+        if: ${{ steps.publish_transistor.outputs.transistor_share_url != '' }}
         run: |
-          echo "- **Buzzsprout episode published** ✓" >> $GITHUB_STEP_SUMMARY
-          echo "- **Buzzsprout episode id:** ${{ steps.publish_buzzsprout.outputs.buzzsprout_episode_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Buzzsprout audio URL:** ${{ steps.publish_buzzsprout.outputs.buzzsprout_audio_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Transistor episode published** ✓" >> $GITHUB_STEP_SUMMARY
+          echo "- **Transistor share URL:** ${{ steps.publish_transistor.outputs.transistor_share_url }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload script + MP3 artifact (dry-run / debugging)
         if: ${{ always() }}
