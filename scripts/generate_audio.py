@@ -258,6 +258,25 @@ def main() -> int:
         f.write(mp3)
     print(f"MP3: {len(mp3)} bytes -> out/{fname}")
 
+    # Episode metadata for the downstream Transistor.fm publish step — all derived from the
+    # Ghost post we already fetched (title/slug/url/date/excerpt). The workflow reads these
+    # files instead of taking them as hand-typed inputs. Only written when a new MP3 exists
+    # (i.e. not on the idempotent skip above), so the publish step can no-op cleanly.
+    excerpt = (post.get("custom_excerpt") or post.get("excerpt") or "").strip().replace("\n", " ")
+    summary = re.split(r"(?<=[.!?])\s", excerpt)[0].strip()[:280] if excerpt else \
+        f"Pre-market intelligence brief for {date_str}."
+    episode_meta = {
+        "episode_title.txt":    post.get("title") or "The Tape Read",
+        "episode_date.txt":     dt.strftime("%Y-%m-%d"),
+        "episode_url.txt":      post.get("url") or f"{api_url}/{post.get('slug', '')}/",
+        "episode_summary.txt":  summary,
+        "episode_mp3_path.txt": f"out/{fname}",
+    }
+    for meta_name, meta_val in episode_meta.items():
+        with open(f"out/{meta_name}", "w", encoding="utf-8") as f:
+            f.write(meta_val)
+    print(f"episode metadata -> out/ (date={episode_meta['episode_date.txt']}, url={episode_meta['episode_url.txt']})")
+
     if dry_run:
         print("DRY_RUN=true — script + MP3 written to out/ as artifacts; NOT uploading or patching Ghost.")
         return 0

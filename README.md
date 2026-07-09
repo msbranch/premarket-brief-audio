@@ -18,6 +18,8 @@ Tick `dry_run` to generate the script + MP3 as a downloadable artifact without p
 5. Patches the post with the audio player. On paid posts the player sits **inside** the
    paywalled region (same access as the brief), so it's members-only. On public posts it's
    at the top for everyone.
+6. Publishes the same MP3 to **Transistor.fm** as a published podcast episode (title/date/
+   summary/Ghost URL derived from the post). Skipped on `dry_run`.
 
 Idempotent — re-running on the same post is a safe no-op (it detects the existing player).
 
@@ -29,6 +31,8 @@ Idempotent — re-running on the same post is a safe no-op (it detects the exist
 | `ANTHROPIC_API_KEY` | Anthropic API key |
 | `ELEVENLABS_API_KEY` | ElevenLabs API key |
 | `ELEVENLABS_VOICE_ID` | ElevenLabs voice id (placeholder until a voice is chosen) |
+| `TRANSISTOR_API_KEY` | Transistor.fm API key (Account settings → API Key) |
+| `TRANSISTOR_SHOW_ID` | Transistor.fm show ID (numeric ID in the dashboard URL) |
 
 ## Getting the post ID
 Ghost admin → open the published post → the 24-hex ID is in the editor URL
