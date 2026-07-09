@@ -51,8 +51,9 @@ def main():
     ap = argparse.ArgumentParser(description="Publish an MP3 to Transistor.fm as a podcast episode.")
     ap.add_argument("--audio-file", required=True, help="path to the MP3 file")
     ap.add_argument("--title", required=True, help="episode title (matches the Ghost post title)")
-    ap.add_argument("--date", required=True, help="brief date, YYYY-MM-DD")
-    ap.add_argument("--summary", required=True, help="one-sentence episode summary")
+    ap.add_argument("--date", required=True, help="brief date, e.g. 'July 9, 2026'")
+    ap.add_argument("--summary", required=False, default="", help="episode summary (blank = omitted)")
+    ap.add_argument("--keywords", required=False, default="", help="comma-separated keywords")
     ap.add_argument("--ghost-url", required=True, help="full URL of the published Ghost post")
     args = ap.parse_args()
 
@@ -103,17 +104,19 @@ def main():
         f"Full written brief (paid subscribers): {args.ghost_url} | thetaperead.morganbranch.co"
     )
     # POST /v1/episodes creates a DRAFT — it does not accept `status`. Publishing is a
-    # separate call (below).
-    payload = {
-        "episode": {
-            "show_id": show_id,
-            "title": args.title,
-            "summary": args.summary,
-            "description": description,
-            "audio_url": audio_url,
-            "explicit": "false",
-        }
+    # separate call (below). Summary is intentionally omitted unless explicitly provided.
+    episode = {
+        "show_id": show_id,
+        "title": args.title,
+        "description": description,
+        "audio_url": audio_url,
+        "explicit": "false",
     }
+    if args.summary.strip():
+        episode["summary"] = args.summary.strip()
+    if args.keywords.strip():
+        episode["keywords"] = args.keywords.strip()
+    payload = {"episode": episode}
     r3 = requests.post(
         f"{API_BASE}/episodes",
         headers={"x-api-key": api_key, "Content-Type": "application/json"},

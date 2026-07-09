@@ -98,7 +98,7 @@ def req_json(method, url, headers, body=None, timeout=120):
 
 # --- step 1: fetch the published brief (Admin API) ------------------------
 def get_post(api_url, admin_key, post_id):
-    url = f"{api_url}/ghost/api/admin/posts/{post_id}/?formats=html"
+    url = f"{api_url}/ghost/api/admin/posts/{post_id}/?formats=html&include=tags"
     hdr = {"Authorization": f"Ghost {make_jwt(admin_key)}", "Accept-Version": "v5.0"}
     return req_json("GET", url, hdr)["posts"][0]
 
@@ -206,23 +206,43 @@ def patch_post(api_url, admin_key, post_id, updated_at, new_html):
 
 
 # --- episode metadata + MP3 reuse (for the Transistor publish step) --------
+# Base brand keywords applied to every episode; the post's public Ghost tags are appended.
+KEYWORDS_BASE = ["pre-market", "options flow", "unusual options activity", "options trading",
+                 "stock market", "day trading", "market analysis"]
+# Structural/internal tags that should never become podcast keywords.
+KEYWORDS_EXCLUDE_SLUGS = {"the-full-read"}
+
+
+def build_keywords(post):
+    """Base brand keywords + the post's public Ghost tags (minus internal/structural ones)."""
+    kws, seen = list(KEYWORDS_BASE), {k.lower() for k in KEYWORDS_BASE}
+    for tag in (post.get("tags") or []):
+        if (tag.get("visibility") or "public") == "internal":
+            continue
+        if (tag.get("slug") or "") in KEYWORDS_EXCLUDE_SLUGS:
+            continue
+        name = (tag.get("name") or "").strip()
+        if name and name.lower() not in seen:
+            kws.append(name)
+            seen.add(name.lower())
+    return ", ".join(kws)
+
+
 def write_episode_meta(post, dt, date_str, fname, api_url):
     """Write out/episode_*.txt from data already fetched from Ghost, for the workflow's
-    Transistor step to read (title / date / public URL / summary + the MP3 path on disk)."""
-    excerpt = (post.get("custom_excerpt") or post.get("excerpt") or "").strip().replace("\n", " ")
-    summary = re.split(r"(?<=[.!?])\s", excerpt)[0].strip()[:280] if excerpt else \
-        f"Pre-market intelligence brief for {date_str}."
+    Transistor step to read (title / written date / public URL / keywords + the MP3 path).
+    No summary file — episodes intentionally carry no summary."""
     meta = {
         "episode_title.txt":    post.get("title") or "The Tape Read",
-        "episode_date.txt":     dt.strftime("%Y-%m-%d"),
+        "episode_date.txt":     dt.strftime("%B %-d, %Y"),   # e.g. "July 9, 2026"
         "episode_url.txt":      post.get("url") or f"{api_url}/{post.get('slug', '')}/",
-        "episode_summary.txt":  summary,
+        "episode_keywords.txt": build_keywords(post),
         "episode_mp3_path.txt": f"out/{fname}",
     }
     for name, val in meta.items():
         with open(f"out/{name}", "w", encoding="utf-8") as f:
             f.write(val)
-    print(f"episode metadata -> out/ (date={meta['episode_date.txt']}, url={meta['episode_url.txt']})")
+    print(f"episode metadata -> out/ (date={meta['episode_date.txt']}, keywords={meta['episode_keywords.txt']!r})")
 
 
 def existing_card_mp3_url(html):
