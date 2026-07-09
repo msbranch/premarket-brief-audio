@@ -56,10 +56,10 @@ def main():
     ap.add_argument("--ghost-url", required=True, help="full URL of the published Ghost post")
     args = ap.parse_args()
 
-    api_key = os.environ.get("TRANSISTOR_API_KEY")
+    api_key = (os.environ.get("TRANSISTOR_API_KEY") or "").strip()
     if not api_key:
         die("TRANSISTOR_API_KEY is not set")
-    show_id = os.environ.get("TRANSISTOR_SHOW_ID")
+    show_id = (os.environ.get("TRANSISTOR_SHOW_ID") or "").strip()
     if not show_id:
         die("TRANSISTOR_SHOW_ID is not set")
 
