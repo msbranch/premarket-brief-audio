@@ -70,6 +70,7 @@ jobs:
             --title "$(cat out/episode_title.txt)" \
             --date "$(cat out/episode_date.txt)" \
             --keywords "$(cat out/episode_keywords.txt)" \
+            --excerpt "$(cat out/episode_excerpt.txt)" \
             --ghost-url "$(cat out/episode_url.txt)"
 
       - name: Publish summary

@@ -232,11 +232,13 @@ def write_episode_meta(post, dt, date_str, fname, api_url):
     """Write out/episode_*.txt from data already fetched from Ghost, for the workflow's
     Transistor step to read (title / written date / public URL / keywords + the MP3 path).
     No summary file — episodes intentionally carry no summary."""
+    excerpt = re.sub(r"\s+", " ", (post.get("custom_excerpt") or post.get("excerpt") or "")).strip()
     meta = {
         "episode_title.txt":    post.get("title") or "The Tape Read",
         "episode_date.txt":     dt.strftime("%B %-d, %Y"),   # e.g. "July 9, 2026"
         "episode_url.txt":      post.get("url") or f"{api_url}/{post.get('slug', '')}/",
         "episode_keywords.txt": build_keywords(post),
+        "episode_excerpt.txt":  excerpt,
         "episode_mp3_path.txt": f"out/{fname}",
     }
     for name, val in meta.items():

@@ -21,6 +21,8 @@ import argparse
 
 import requests
 
+from episode_description import build_description
+
 API_BASE = "https://api.transistor.fm/v1"
 
 
@@ -34,22 +36,20 @@ def main():
     ap.add_argument("--episode-id", required=True, help="Transistor episode id")
     ap.add_argument("--title", required=True, help="episode title")
     ap.add_argument("--date", required=True, help="brief date, e.g. 'July 9, 2026'")
-    ap.add_argument("--ghost-url", required=True, help="full URL of the published Ghost post")
+    ap.add_argument("--ghost-url", required=True, help="Ghost post URL (goes in alternate_url)")
     ap.add_argument("--keywords", required=False, default="", help="comma-separated keywords")
+    ap.add_argument("--excerpt", required=False, default="", help="post excerpt for the description")
     args = ap.parse_args()
 
     api_key = (os.environ.get("TRANSISTOR_API_KEY") or "").strip()
     if not api_key:
         die("TRANSISTOR_API_KEY is not set")
 
-    description = (
-        f"The Tape Read — Pre-Market Intelligence Brief for {args.date}. "
-        f"Full written brief (paid subscribers): {args.ghost_url} | thetaperead.morganbranch.co"
-    )
     episode = {
         "title": args.title,
-        "description": description,
-        "summary": "",   # explicitly blank the summary
+        "description": build_description(args.date, args.excerpt),
+        "summary": "",                       # explicitly blank the summary
+        "alternate_url": args.ghost_url,     # Ghost post URL lives here, not in the description
     }
     if args.keywords.strip():
         episode["keywords"] = args.keywords.strip()
@@ -66,6 +66,8 @@ def main():
     attrs = r.json()["data"].get("attributes", {})
     print(f"updated episode {args.episode_id}: status={attrs.get('status')!r} "
           f"summary={attrs.get('summary')!r} keywords={attrs.get('keywords')!r}")
+    print(f"  alternate_url={attrs.get('alternate_url')!r}")
+    print(f"  description={attrs.get('description')!r}")
 
 
 if __name__ == "__main__":

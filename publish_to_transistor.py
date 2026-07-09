@@ -32,6 +32,8 @@ import argparse
 
 import requests
 
+from episode_description import build_description
+
 API_BASE = "https://api.transistor.fm/v1"
 
 
@@ -54,7 +56,8 @@ def main():
     ap.add_argument("--date", required=True, help="brief date, e.g. 'July 9, 2026'")
     ap.add_argument("--summary", required=False, default="", help="episode summary (blank = omitted)")
     ap.add_argument("--keywords", required=False, default="", help="comma-separated keywords")
-    ap.add_argument("--ghost-url", required=True, help="full URL of the published Ghost post")
+    ap.add_argument("--excerpt", required=False, default="", help="post excerpt for the description")
+    ap.add_argument("--ghost-url", required=True, help="Ghost post URL (goes in alternate_url)")
     args = ap.parse_args()
 
     api_key = (os.environ.get("TRANSISTOR_API_KEY") or "").strip()
@@ -99,17 +102,15 @@ def main():
     print(f"uploaded {len(mp3_bytes)} bytes to Transistor storage")
 
     # --- Call 3: create the published episode record --------------------------
-    description = (
-        f"The Tape Read — Pre-Market Intelligence Brief for {args.date}. "
-        f"Full written brief (paid subscribers): {args.ghost_url} | thetaperead.morganbranch.co"
-    )
     # POST /v1/episodes creates a DRAFT — it does not accept `status`. Publishing is a
     # separate call (below). Summary is intentionally omitted unless explicitly provided.
+    # The Ghost post URL goes in alternate_url, not the description.
     episode = {
         "show_id": show_id,
         "title": args.title,
-        "description": description,
+        "description": build_description(args.date, args.excerpt),
         "audio_url": audio_url,
+        "alternate_url": args.ghost_url,
         "explicit": "false",
     }
     if args.summary.strip():
