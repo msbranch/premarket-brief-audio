@@ -70,10 +70,12 @@ def main():
     auth_headers = {"x-api-key": api_key}
 
     # --- Call 1: request a pre-signed upload URL -------------------------------
+    # authorize_upload accepts ONLY `filename`. content_type goes on the Call-2 PUT header
+    # and show_id on the Call-3 episode body; sending them here returns HTTP 400.
     r1 = requests.get(
         f"{API_BASE}/episodes/authorize_upload",
         headers=auth_headers,
-        params={"filename": filename, "content_type": "audio/mpeg", "show_id": show_id},
+        params={"filename": filename},
         timeout=60,
     )
     check(r1, "authorize_upload")
