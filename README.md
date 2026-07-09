@@ -18,8 +18,9 @@ Tick `dry_run` to generate the script + MP3 as a downloadable artifact without p
 5. Patches the post with the audio player. On paid posts the player sits **inside** the
    paywalled region (same access as the brief), so it's members-only. On public posts it's
    at the top for everyone.
-6. Publishes the same MP3 to **Transistor.fm** as a published podcast episode (title/date/
-   summary/Ghost URL derived from the post). Skipped on `dry_run`.
+6. Publishes the same MP3 to **Transistor.fm** as a published podcast episode — title,
+   written date (e.g. "July 9, 2026"), keywords (a fixed brand base plus the post's public
+   Ghost tags), and Ghost URL, all derived from the post. No summary. Skipped on `dry_run`.
 
 Ghost-idempotent — if the post already has the player, the Ghost patch is skipped and the
 already-hosted MP3 is reused for the Transistor step. Transistor has no such guard, so
