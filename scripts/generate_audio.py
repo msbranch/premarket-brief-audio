@@ -15,8 +15,11 @@ Sequence:
      an already-fully-gated body) so the audio is members-only — same access as the
      brief. On public posts it's simply prepended.
 
-Idempotent: if the post already carries the audio card (id="tape-read-audio"),
-it exits 0 without re-patching.
+Ghost-idempotent: if the post already carries the audio card (id="tape-read-audio"),
+the Ghost upload/patch is skipped. The MP3 Ghost is already hosting is reused (downloaded
+and written to out/ with episode metadata) so the downstream Transistor step can still
+publish it. Note: Transistor itself has no idempotency guard — re-running a post that is
+already on Transistor will create a duplicate episode.
 
 Stdlib only — no pip installs.
 """
@@ -202,6 +205,39 @@ def patch_post(api_url, admin_key, post_id, updated_at, new_html):
     return req_json("PUT", url, hdr, body)
 
 
+# --- episode metadata + MP3 reuse (for the Transistor publish step) --------
+def write_episode_meta(post, dt, date_str, fname, api_url):
+    """Write out/episode_*.txt from data already fetched from Ghost, for the workflow's
+    Transistor step to read (title / date / public URL / summary + the MP3 path on disk)."""
+    excerpt = (post.get("custom_excerpt") or post.get("excerpt") or "").strip().replace("\n", " ")
+    summary = re.split(r"(?<=[.!?])\s", excerpt)[0].strip()[:280] if excerpt else \
+        f"Pre-market intelligence brief for {date_str}."
+    meta = {
+        "episode_title.txt":    post.get("title") or "The Tape Read",
+        "episode_date.txt":     dt.strftime("%Y-%m-%d"),
+        "episode_url.txt":      post.get("url") or f"{api_url}/{post.get('slug', '')}/",
+        "episode_summary.txt":  summary,
+        "episode_mp3_path.txt": f"out/{fname}",
+    }
+    for name, val in meta.items():
+        with open(f"out/{name}", "w", encoding="utf-8") as f:
+            f.write(val)
+    print(f"episode metadata -> out/ (date={meta['episode_date.txt']}, url={meta['episode_url.txt']})")
+
+
+def existing_card_mp3_url(html):
+    """Pull the hosted MP3 URL out of an already-present audio card's <source src=...>."""
+    m = re.search(r'id="' + re.escape(AUDIO_CARD_ID) + r'".*?<source[^>]+src="([^"]+)"',
+                  html, re.DOTALL | re.IGNORECASE)
+    return htmllib.unescape(m.group(1)) if m else None
+
+
+def download_mp3(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "tape-read-audio/1.0"})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return resp.read()
+
+
 # --- main -----------------------------------------------------------------
 def main() -> int:
     api_url     = (os.environ.get("GHOST_ADMIN_API_URL") or "").rstrip("/")
@@ -233,16 +269,33 @@ def main() -> int:
     status = post.get("status") or "unknown"
     print(f"post {post_id}: status={status}, visibility={visibility}, title={post.get('title')!r}")
 
-    if f'id="{AUDIO_CARD_ID}"' in html:
-        print("audio card already present — nothing to do (idempotent skip).")
-        return 0
-    if status != "published":
-        print(f"::warning::post status is {status!r}, not 'published' — proceeding, but you normally trigger this after publishing.")
-
-    # date (ET) for the narration intro/outro
+    # date (ET) — used for the narration, the episode metadata, and the MP3 filename
     pub = post.get("published_at") or datetime.datetime.now(ET).isoformat()
     dt = datetime.datetime.fromisoformat(pub.replace("Z", "+00:00")).astimezone(ET)
     date_str = dt.strftime("%A, %B %-d, %Y")
+    fname = f"tape-read-{dt.strftime('%Y%m%d')}.mp3"
+
+    # Already carries the Ghost audio card: don't re-patch Ghost or re-run TTS. Reuse the MP3
+    # that Ghost is already hosting so the downstream Transistor step can still publish it.
+    if f'id="{AUDIO_CARD_ID}"' in html:
+        print("audio card already present on Ghost — skipping Ghost patch; reusing the hosted MP3.")
+        mp3_url = existing_card_mp3_url(html)
+        if not mp3_url:
+            print("::error::audio card present but no MP3 <source> URL found; cannot reuse.")
+            return 1
+        try:
+            mp3 = download_mp3(mp3_url)
+        except urllib.error.HTTPError as e:
+            print(f"::error::could not download existing MP3 ({mp3_url}) (HTTP {e.code}).")
+            return 1
+        with open(f"out/{fname}", "wb") as f:
+            f.write(mp3)
+        print(f"reused {len(mp3)} bytes from {mp3_url} -> out/{fname}")
+        write_episode_meta(post, dt, date_str, fname, api_url)
+        return 0
+
+    if status != "published":
+        print(f"::warning::post status is {status!r}, not 'published' — proceeding, but you normally trigger this after publishing.")
 
     brief_text = html_to_text(html)
     print(f"brief text: {len(brief_text)} chars -> generating script with {ANTHROPIC_MODEL} ...")
@@ -253,29 +306,11 @@ def main() -> int:
 
     print(f"synthesizing MP3 with ElevenLabs ({ELEVENLABS_MODEL}) ...")
     mp3 = synthesize(eleven_key, voice_id, script)
-    fname = f"tape-read-{dt.strftime('%Y%m%d')}.mp3"
     with open(f"out/{fname}", "wb") as f:
         f.write(mp3)
     print(f"MP3: {len(mp3)} bytes -> out/{fname}")
 
-    # Episode metadata for the downstream Transistor.fm publish step — all derived from the
-    # Ghost post we already fetched (title/slug/url/date/excerpt). The workflow reads these
-    # files instead of taking them as hand-typed inputs. Only written when a new MP3 exists
-    # (i.e. not on the idempotent skip above), so the publish step can no-op cleanly.
-    excerpt = (post.get("custom_excerpt") or post.get("excerpt") or "").strip().replace("\n", " ")
-    summary = re.split(r"(?<=[.!?])\s", excerpt)[0].strip()[:280] if excerpt else \
-        f"Pre-market intelligence brief for {date_str}."
-    episode_meta = {
-        "episode_title.txt":    post.get("title") or "The Tape Read",
-        "episode_date.txt":     dt.strftime("%Y-%m-%d"),
-        "episode_url.txt":      post.get("url") or f"{api_url}/{post.get('slug', '')}/",
-        "episode_summary.txt":  summary,
-        "episode_mp3_path.txt": f"out/{fname}",
-    }
-    for meta_name, meta_val in episode_meta.items():
-        with open(f"out/{meta_name}", "w", encoding="utf-8") as f:
-            f.write(meta_val)
-    print(f"episode metadata -> out/ (date={episode_meta['episode_date.txt']}, url={episode_meta['episode_url.txt']})")
+    write_episode_meta(post, dt, date_str, fname, api_url)
 
     if dry_run:
         print("DRY_RUN=true — script + MP3 written to out/ as artifacts; NOT uploading or patching Ghost.")

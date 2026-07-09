@@ -21,7 +21,9 @@ Tick `dry_run` to generate the script + MP3 as a downloadable artifact without p
 6. Publishes the same MP3 to **Transistor.fm** as a published podcast episode (title/date/
    summary/Ghost URL derived from the post). Skipped on `dry_run`.
 
-Idempotent — re-running on the same post is a safe no-op (it detects the existing player).
+Ghost-idempotent — if the post already has the player, the Ghost patch is skipped and the
+already-hosted MP3 is reused for the Transistor step. Transistor has no such guard, so
+re-running a post that's already on Transistor creates a duplicate episode.
 
 ## Required secrets (Settings → Secrets and variables → Actions)
 | Secret | Value |
