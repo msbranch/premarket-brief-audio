@@ -147,8 +147,19 @@ def synthesize(eleven_key, voice_id, script):
     body = json.dumps({"text": script, "model_id": ELEVENLABS_MODEL, "voice_settings": VOICE_SETTINGS}).encode()
     r = urllib.request.Request(url, data=body, method="POST", headers={
         "xi-api-key": eleven_key, "Content-Type": "application/json", "Accept": "audio/mpeg"})
-    with urllib.request.urlopen(r, timeout=300) as resp:
-        return resp.read()
+    try:
+        with urllib.request.urlopen(r, timeout=300) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        # ElevenLabs returns the real reason in the JSON body (e.g. invalid_api_key,
+        # quota_exceeded, or detected_unusual_activity which disables API access on some
+        # plans). The bare "HTTP 401" hides it — surface the body so the cause is actionable.
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:800]
+        except Exception:
+            pass
+        raise RuntimeError(f"ElevenLabs TTS failed: HTTP {e.code} {e.reason} — {detail}") from None
 
 
 # --- step 4: MP3 -> Ghost media store -> public URL -----------------------
