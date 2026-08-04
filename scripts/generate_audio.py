@@ -262,11 +262,14 @@ def download_mp3(url):
 
 # --- main -----------------------------------------------------------------
 def main() -> int:
-    api_url     = (os.environ.get("GHOST_ADMIN_API_URL") or "").rstrip("/")
-    admin_key   = os.environ.get("GHOST_ADMIN_API_KEY") or ""
-    anthropic   = os.environ.get("ANTHROPIC_API_KEY") or ""
-    eleven_key  = os.environ.get("ELEVENLABS_API_KEY") or ""
-    voice_id    = os.environ.get("ELEVENLABS_VOICE_ID") or ""
+    # .strip() every credential: a trailing newline pasted into a GitHub secret would otherwise
+    # ride along in the auth header and surface as a spurious HTTP 401 (the key looks "active" in
+    # the provider dashboard, but the header value is malformed).
+    api_url     = (os.environ.get("GHOST_ADMIN_API_URL") or "").strip().rstrip("/")
+    admin_key   = (os.environ.get("GHOST_ADMIN_API_KEY") or "").strip()
+    anthropic   = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    eleven_key  = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    voice_id    = (os.environ.get("ELEVENLABS_VOICE_ID") or "").strip()
     post_id     = (os.environ.get("POST_ID") or "").strip()
     dry_run     = (os.environ.get("DRY_RUN") or "false").lower() == "true"
 
