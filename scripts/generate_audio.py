@@ -35,6 +35,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 ELEVENLABS_MODEL  = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 ELEVEN_OUTPUT_FMT = "mp3_44100_128"
 MAX_TTS_CHARS     = 9500          # eleven_multilingual_v2 caps ~10k chars/request
+SCRIPT_MAX_ATTEMPTS = 3           # retries when the model overruns max_tokens (non-deterministic runaway)
 AUDIO_CARD_ID     = "tape-read-audio"   # idempotency sentinel
 
 # ElevenLabs voice character; tune once a voice is chosen.
@@ -125,16 +126,27 @@ def generate_script(anthropic_key, brief_text, date_str):
             f"Here is today's written brief. Convert it into the spoken narration per the rules.\n\n{brief_text}"}],
     }
     hdr = {"x-api-key": anthropic_key, "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json"}
-    data = req_json("POST", "https://api.anthropic.com/v1/messages", hdr, body)
-    parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-    script = "".join(parts).strip()
-    if not script:
-        raise RuntimeError("Anthropic returned an empty script")
-    if data.get("stop_reason") == "max_tokens":
-        # Hit the ceiling -> the script is truncated mid-sentence and the closing line is missing.
-        # Fail loudly rather than synthesize a cut-off MP3 (and never patch a live post with it).
-        raise RuntimeError("Anthropic hit max_tokens — script was truncated; raise max_tokens or tighten the length target")
-    return script
+
+    # The model occasionally ignores the length cap and runs to the max_tokens ceiling, which
+    # truncates the script mid-sentence (no closing line). Output is non-deterministic, so a fresh
+    # attempt almost always lands a properly-sized script — retry a few times before giving up
+    # rather than failing the whole run on a one-off runaway generation.
+    last_err = "unknown error"
+    for attempt in range(1, SCRIPT_MAX_ATTEMPTS + 1):
+        data = req_json("POST", "https://api.anthropic.com/v1/messages", hdr, body)
+        parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+        script = "".join(parts).strip()
+        if not script:
+            last_err = "Anthropic returned an empty script"
+        elif data.get("stop_reason") == "max_tokens":
+            last_err = "Anthropic hit max_tokens — script was truncated (model overran the length cap)"
+        else:
+            return script
+        if attempt < SCRIPT_MAX_ATTEMPTS:
+            print(f"::warning::script attempt {attempt}/{SCRIPT_MAX_ATTEMPTS} failed ({last_err}); retrying ...")
+
+    # Fail loudly rather than synthesize a cut-off MP3 (and never patch a live post with it).
+    raise RuntimeError(f"{last_err}; exhausted {SCRIPT_MAX_ATTEMPTS} attempts — tighten the length target if this persists")
 
 
 # --- step 3: spoken script -> MP3 (ElevenLabs) ----------------------------
