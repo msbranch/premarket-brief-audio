@@ -49,9 +49,11 @@ MAX_TTS_CHARS     = 9500          # eleven_multilingual_v2 caps ~10k chars/reque
 NARRATION_MAX_ATTEMPTS = 3        # re-rolls on truncation OR coverage-assertion failure
 AUDIO_CARD_ID     = "tape-read-audio"   # idempotency sentinel
 
-# Outline budgeting (words).
-FILL_TARGET   = 1000              # fill toward ~1000; HARD_CAP is the assert ceiling
-HARD_CAP      = 1050
+# Outline budgeting (words). The model reliably narrates ~15-20% over the planned budgets,
+# so aim the plan below the hard cap: filling to ~900 lands finished scripts near ~1000 words
+# and under the 1050 ceiling. Raise FILL_TARGET toward 1000 only if scripts come in short.
+FILL_TARGET   = 900               # plan target; the model's natural overshoot lands output ~1000
+HARD_CAP      = 1050              # assert ceiling (never ship longer)
 CARD_FLOOR, CARD_TARGET = 90, 125
 COMPRESSED_PER_NAME = 22          # overflow cards -> one rapid-fire beat, ~a line each
 
@@ -541,22 +543,28 @@ def generate_narration(anthropic_key, outline: Outline, model: BriefModel, date_
         "messages": [{"role": "user", "content": render_outline_for_model(outline)}],
     }
     hdr = {"x-api-key": anthropic_key, "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json"}
+    base_user = render_outline_for_model(outline)
 
-    # The model can overrun max_tokens (truncated, mid-sentence) or drop a beat/name. Output
-    # is non-deterministic, so a fresh attempt almost always fixes it — re-roll a few times,
-    # then fail loudly rather than ship a cut-off or incomplete script to a live post.
+    # The model can overrun max_tokens, run long, or drop a beat/name. Rather than blindly
+    # re-roll, feed the failed draft back with a targeted critique so the next attempt
+    # converges. Fail loudly only after exhausting attempts — never ship a bad script.
+    messages = [{"role": "user", "content": base_user}]
     last = "unknown error"
     for attempt in range(1, NARRATION_MAX_ATTEMPTS + 1):
+        body["messages"] = messages
         data = req_json("POST", "https://api.anthropic.com/v1/messages", hdr, body)
         content = data.get("content", []) or []
         parts = [b.get("text", "") for b in content if b.get("type") == "text"]
         script = "".join(parts).strip()
+        truncated = data.get("stop_reason") == "max_tokens"
         if not script:
             block_types = [b.get("type") for b in content]
             last = (f"empty script (stop_reason={data.get('stop_reason')!r}, "
                     f"blocks={block_types}, usage={data.get('usage')})")
-        elif data.get("stop_reason") == "max_tokens":
+            reasons = [last]
+        elif truncated:
             last = "hit max_tokens — script truncated (model overran the length cap)"
+            reasons = [last]
         else:
             ok, reasons = assert_coverage(script, outline, model)
             if ok:
@@ -564,8 +572,36 @@ def generate_narration(anthropic_key, outline: Outline, model: BriefModel, date_
             last = "coverage failed — " + "; ".join(reasons)
         if attempt < NARRATION_MAX_ATTEMPTS:
             print(f"::warning::narration attempt {attempt}/{NARRATION_MAX_ATTEMPTS}: {last}; retrying ...")
+            if script and not truncated:              # show the draft + critique so it self-corrects
+                messages = [{"role": "user", "content": base_user},
+                            {"role": "assistant", "content": script},
+                            {"role": "user", "content": _critique(script, reasons)}]
+            else:                                     # empty/truncated: just retry the base prompt
+                messages = [{"role": "user", "content": base_user}]
 
     raise RuntimeError(f"{last}; exhausted {NARRATION_MAX_ATTEMPTS} attempts")
+
+
+def _critique(script, reasons):
+    wc = len(script.split())
+    parts = ["Your previous draft did not pass checks. Produce a corrected version — keep the "
+             "verbatim first and last sentences and the same beat order."]
+    for r in reasons:
+        if r.startswith("over word cap"):
+            parts.append(f"It was {wc} words; the HARD limit is {HARD_CAP} and the target is about "
+                         f"{FILL_TARGET + 60}. Cut roughly {wc - (FILL_TARGET + 60)} words by "
+                         "compressing the lower-priority beats (rates, macro-to-options bridge, "
+                         "scorecard, next-session); keep every watchlist name and the macro read.")
+        elif r.startswith("watchlist name dropped"):
+            parts.append(f"You omitted a required name — {r.split(':',1)[1].strip()}. Include it.")
+        elif "symbol" in r or "ticker" in r or "debris" in r:
+            parts.append("Remove any $ or % signs, ticker letters, and table fragments — speak "
+                         "numbers and company names as words.")
+        elif r.startswith("beat likely dropped"):
+            parts.append(f"You skipped a required beat ({r.split(':',1)[1].strip()}); cover it briefly.")
+        else:
+            parts.append(r)
+    return " ".join(parts)
 
 
 # --- step 5: coverage assertion -------------------------------------------
