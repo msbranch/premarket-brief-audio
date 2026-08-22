@@ -46,14 +46,14 @@ ANTHROPIC_VERSION = "2023-06-01"
 ELEVENLABS_MODEL  = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 ELEVEN_OUTPUT_FMT = "mp3_44100_128"
 MAX_TTS_CHARS     = 9500          # eleven_multilingual_v2 caps ~10k chars/request
-NARRATION_MAX_ATTEMPTS = 3        # re-rolls on truncation OR coverage-assertion failure
+NARRATION_MAX_ATTEMPTS = 4        # re-rolls on truncation OR coverage-assertion failure
 AUDIO_CARD_ID     = "tape-read-audio"   # idempotency sentinel
 
-# Outline budgeting (words). The model reliably narrates ~15-20% over the planned budgets,
-# so aim the plan below the hard cap: filling to ~900 lands finished scripts near ~1000 words
-# and under the 1050 ceiling. Raise FILL_TARGET toward 1000 only if scripts come in short.
-FILL_TARGET   = 900               # plan target; the model's natural overshoot lands output ~1000
-HARD_CAP      = 1050              # assert ceiling (never ship longer)
+# Outline budgeting (words). Live data: a dense Tape Read brief's natural spoken length is
+# ~1150-1250 (the previous pipeline shipped 1180-1245), so the cap is 1250. The model narrates
+# well over the planned budgets, and the feedback-retry converges it under the cap.
+FILL_TARGET   = 1000              # plan target for budget distribution
+HARD_CAP      = 1250              # assert ceiling (never ship longer)
 CARD_FLOOR, CARD_TARGET = 90, 125
 COMPRESSED_PER_NAME = 22          # overflow cards -> one rapid-fire beat, ~a line each
 
@@ -117,12 +117,12 @@ NARRATION_SYSTEM = """You are the voice of "The Tape Read," a pre-market options
 You will receive an OUTLINE: an ordered list of beats, each with a word budget and the facts to cover.
 Narrate the whole outline as ONE flowing spoken piece — a desk analyst walking someone through the open.
 
-LENGTH IS A HARD CAP: the ENTIRE narration must be AT MOST 1050 words — about six to seven minutes spoken.
-This ceiling is ABSOLUTE and OVERRIDES completeness. Target roughly 1000 words total.
+LENGTH IS A HARD CAP: the ENTIRE narration must be AT MOST 1250 words — about seven to eight minutes spoken.
+This ceiling is ABSOLUTE and OVERRIDES completeness. Target roughly 1150 words total.
 
 FOLLOW THE PLAN:
 - Cover the beats in the given order. Hit each beat's word budget (within about 15%); the budgets sum to the target.
-- If you would run long, COMPRESS — trim the lower-priority beats toward their budgets; never exceed the 1050-word cap.
+- If you would run long, COMPRESS — trim the lower-priority beats toward their budgets; never exceed the 1250-word cap.
 - Use ONLY the facts provided in each beat. Do not invent numbers, names, or catalysts.
 - Do NOT announce structure ("Section 4", "next beat", "the scorecard section"); just speak, with natural transitions.
 
@@ -593,12 +593,13 @@ def _critique(script, reasons):
     wc = len(script.split())
     parts = ["Your previous draft did not pass checks. Produce a corrected version — keep the "
              "verbatim first and last sentences and the same beat order."]
+    target = HARD_CAP - 100
     for r in reasons:
         if r.startswith("over word cap"):
             parts.append(f"It was {wc} words; the HARD limit is {HARD_CAP} and the target is about "
-                         f"{FILL_TARGET + 60}. Cut roughly {wc - (FILL_TARGET + 60)} words by "
-                         "compressing the lower-priority beats (rates, macro-to-options bridge, "
-                         "scorecard, next-session); keep every watchlist name and the macro read.")
+                         f"{target}. Cut roughly {wc - target} words by tightening the lower-priority "
+                         "beats (rates, macro-to-options bridge, scorecard, next-session) to two or "
+                         "three sentences each; keep every watchlist name and the macro read.")
         elif r.startswith("watchlist name dropped"):
             parts.append(f"You omitted a required name — {r.split(':',1)[1].strip()}. Include it.")
         elif "symbol" in r or "ticker" in r or "debris" in r:

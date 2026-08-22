@@ -17,7 +17,7 @@ Tick `dry_run` to generate the script + MP3 as a downloadable artifact without p
    malformed brief rather than narrating it.
 3. **Builds a beat-plan** (deterministic): a fixed set of beats, each with a word budget set
    by floor/target/priority, so every watchlist name is guaranteed its own budgeted beat and
-   the shape is identical every session (~1,000 words, hard cap 1,050).
+   the shape is identical every session (~1,150 words, hard cap 1,250).
 4. **Narrates** the plan in one Anthropic call (Sonnet 5) — the model writes prose only; the
    structure and coverage are already decided in code.
 5. **Asserts coverage** (code): verbatim open/close, every watchlist name spoken, no raw
