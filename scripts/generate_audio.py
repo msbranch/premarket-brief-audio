@@ -844,6 +844,9 @@ def main() -> int:
     print(f"parsed: {len(model.cards)} watchlist card(s), {len(model.sections)} sections, "
           f"tables={sorted(model.tables)}")
     print(f"section titles: {list(model.sections)}")
+    for c in model.cards:
+        print(f"  card: company={c.company!r} ticker={c.ticker!r} "
+              f"tier={c.tier or '—'!r} priority={c.priority or '—'!r} direction={c.direction or '—'!r}")
 
     # build outline (reserve open/close at their exact word count)
     open_words = len(OPEN_SENTENCE.format(date=date_str).split())
