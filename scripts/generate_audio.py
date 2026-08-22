@@ -113,6 +113,18 @@ BEAT_ANCHORS = {
 }
 
 
+# Some tickers ARE the spoken name — a host pronounces them letter-by-letter ("A-M-D",
+# "I-B-M") and there is no separate company word to use instead. The brief's flow/earnings
+# tables reference such names by ticker, so banning them outright is an impossible coverage
+# constraint (the narration has nothing else to voice). Exempt them; the raw-ticker ban still
+# forces spellable-name tickers (NVDA -> Nvidia, AAPL -> Apple, RDDT -> Reddit) to be spoken
+# as company names.
+SPEAKABLE_TICKERS = frozenset({
+    "AMD", "IBM", "GE", "GM", "HP", "HPE", "HPQ", "UPS", "CVS", "AMC",
+    "BP", "TSM", "SAP", "UBS", "ING", "ASML",
+})
+
+
 NARRATION_SYSTEM = """You are the voice of "The Tape Read," a pre-market options-flow brief.
 You will receive an OUTLINE: an ordered list of beats, each with a word budget and the facts to cover.
 Narrate the whole outline as ONE flowing spoken piece — a desk analyst walking someone through the open.
@@ -664,6 +676,8 @@ def assert_coverage(script: str, outline: Outline, model: BriefModel):
             if row and re.fullmatch(r"[A-Z]{1,6}", row[0]):
                 raw.add(row[0])
     for t in sorted(raw):
+        if t in SPEAKABLE_TICKERS:                             # spoken as letters — voicing it is correct
+            continue
         if re.search(rf"\b{re.escape(t)}\b", s):               # case-sensitive: matches "SPY", not "spy"
             reasons.append(f"raw ticker voiced: {t}")
 
