@@ -115,8 +115,12 @@ NARRATION_SYSTEM = """You are the voice of "The Tape Read," a pre-market options
 You will receive an OUTLINE: an ordered list of beats, each with a word budget and the facts to cover.
 Narrate the whole outline as ONE flowing spoken piece — a desk analyst walking someone through the open.
 
+LENGTH IS A HARD CAP: the ENTIRE narration must be AT MOST 1050 words — about six to seven minutes spoken.
+This ceiling is ABSOLUTE and OVERRIDES completeness. Target roughly 1000 words total.
+
 FOLLOW THE PLAN:
-- Cover the beats in the given order. Aim for each beat's word budget (within about 15%); the totals fit the runtime.
+- Cover the beats in the given order. Hit each beat's word budget (within about 15%); the budgets sum to the target.
+- If you would run long, COMPRESS — trim the lower-priority beats toward their budgets; never exceed the 1050-word cap.
 - Use ONLY the facts provided in each beat. Do not invent numbers, names, or catalysts.
 - Do NOT announce structure ("Section 4", "next beat", "the scorecard section"); just speak, with natural transitions.
 
@@ -417,21 +421,25 @@ def _card_facts(card: Card) -> str:
 
 
 def _context_facts(model: BriefModel) -> dict:
+    # Section keywords are SPECIFIC to avoid collisions in document order — e.g. both
+    # "Sector Flow Gating" and "Options Flow Intelligence" contain "flow", so the gate beat
+    # keys on "gating" and the flow beat on "options flow"/"flow intelligence".
     s, t = model.sections, model.tables
     return {
         "tape_thesis":          model.thesis,
-        "macro_loop":           _section(s, "macro") or " ".join(model.snapshot),
-        "sector_gate":          "\n".join(x for x in (_section(s, "gate", "sector"),
+        "macro_loop":           _section(s, "macro environment", "macro backdrop", "macro loop")
+                                or _section(s, "macro") or " ".join(model.snapshot),
+        "sector_gate":          "\n".join(x for x in (_section(s, "gating", "sector gate", "sector flow"),
                                                       _table_facts(t, "gate")) if x),
         "rate_context":         _section(s, "rate", "yield"),
-        "flow_standouts":       "\n".join(x for x in (_section(s, "flow"),
+        "flow_standouts":       "\n".join(x for x in (_section(s, "options flow", "flow intelligence"),
                                                       _table_facts(t, "flow"),
                                                       _table_facts(t, "net_premium")) if x),
-        "earnings_iv":          "\n".join(x for x in (_section(s, "earning"),
+        "earnings_iv":          "\n".join(x for x in (_section(s, "earnings"),
                                                       _table_facts(t, "earnings")) if x),
-        "macro_options_bridge": _section(s, "bridge", "positioning") or model.thesis,
-        "scorecard":            _section(s, "scorecard", "record", "grade"),
-        "next_session":         _section(s, "next"),
+        "macro_options_bridge": _section(s, "bridge", "macro-to-options") or model.thesis,
+        "scorecard":            _section(s, "scorecard", "session scorecard", "record", "grade"),
+        "next_session":         _section(s, "next-session", "next session"),
         "nocard_explainer":     model.nocard_note,
     }
 
@@ -540,10 +548,13 @@ def generate_narration(anthropic_key, outline: Outline, model: BriefModel, date_
     last = "unknown error"
     for attempt in range(1, NARRATION_MAX_ATTEMPTS + 1):
         data = req_json("POST", "https://api.anthropic.com/v1/messages", hdr, body)
-        parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+        content = data.get("content", []) or []
+        parts = [b.get("text", "") for b in content if b.get("type") == "text"]
         script = "".join(parts).strip()
         if not script:
-            last = "Anthropic returned an empty script"
+            block_types = [b.get("type") for b in content]
+            last = (f"empty script (stop_reason={data.get('stop_reason')!r}, "
+                    f"blocks={block_types}, usage={data.get('usage')})")
         elif data.get("stop_reason") == "max_tokens":
             last = "hit max_tokens — script truncated (model overran the length cap)"
         else:
