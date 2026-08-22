@@ -5,9 +5,10 @@ Runs on a manual trigger, AFTER the brief is published in Ghost. It does not tou
 brief pipeline or its timing.
 
 ## How to run
-Actions → **The Tape Read — Audio** → **Run workflow** → paste the Ghost **post ID** → Run.
-Tick `dry_run` to generate the script + MP3 as a downloadable artifact without patching Ghost
-(use this to audition the voice before going live).
+Actions → **The Tape Read — Audio** → **Run workflow** → paste the Ghost **post ID** *or*
+**slug** → Run. Tick `dry_run` to generate the script + MP3 as a downloadable artifact without
+patching Ghost (use this to audition the voice before going live). Tick `regenerate` to rebuild
+the audio on a post that already has a player — it replaces the old card rather than no-op'ing.
 
 ## What it does
 1. Fetches the published brief from Ghost via the **Admin API** (the Content API truncates

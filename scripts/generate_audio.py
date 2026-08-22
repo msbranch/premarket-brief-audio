@@ -167,8 +167,12 @@ def req_json(method, url, headers, body=None, timeout=120):
 
 
 # --- step 1: fetch the published brief (Admin API) ------------------------
-def get_post(api_url, admin_key, post_id):
-    url = f"{api_url}/ghost/api/admin/posts/{post_id}/?formats=html"
+def get_post(api_url, admin_key, post_id=None, slug=None):
+    """Fetch by 24-hex post id, or by slug (…/posts/slug/<slug>/). One is required."""
+    if slug:
+        url = f"{api_url}/ghost/api/admin/posts/slug/{slug}/?formats=html"
+    else:
+        url = f"{api_url}/ghost/api/admin/posts/{post_id}/?formats=html"
     hdr = {"Authorization": f"Ghost {make_jwt(admin_key)}", "Accept-Version": "v5.0"}
     return req_json("GET", url, hdr)["posts"][0]
 
@@ -183,6 +187,7 @@ class Card:
     company: str
     ticker: str = ""
     tier: str = ""            # "Strong" / "Moderate" / "Weak" (from "Signal Confluence: X")
+    priority: str = ""        # optional "HIGH/MEDIUM/LOW PRIORITY" marker on line 1
     direction: str = ""       # derived from thesis/flow ("call setup" / "put setup" / "")
     price_note: str = ""      # the gap/price context that precedes the Flow Read label
     flow_read: str = ""
@@ -230,22 +235,33 @@ def _blocks(html: str, cls: str):
     return out
 
 
+_PRIORITY_RE = re.compile(r"\b(HIGH|MEDIUM|LOW)\s+PRIORITY\b", re.I)
+_TIER_RE = re.compile(r"Signal\s+Confluence:\s*(Strong|Moderate|Weak)", re.I)
+
+
 def _parse_card(card_html: str) -> Card:
     ps = re.findall(r"<p\b[^>]*>(.*?)</p>", card_html, re.I | re.S)
     _require(ps, "an <div class='ncard'> has no <p> lines")
 
-    # line 1: identity ("TICKER · Company") + the .tier span ("Signal Confluence: X")
-    first = ps[0]
-    tier = ""
-    mt = re.search(r'<span[^>]*class="[^"]*\btier\b[^"]*"[^>]*>(.*?)</span>', first, re.I | re.S)
-    if mt:
-        tier = re.sub(r"(?i)^.*signal\s+confluence:\s*", "", _txt(mt.group(1))).strip()
-        identity = _txt(first[:mt.start()] + first[mt.end():])
-    else:
-        identity = _txt(first)
-    ticker, company = "", identity
-    if "·" in identity:                                   # middot separator
-        ticker, company = (x.strip() for x in identity.split("·", 1))
+    # Line 1 comes in two archive shapes; parse by LABELS, not classes. _txt() strips tags,
+    # so the tier reads the same whether it is in a .tier span, a <b>, or plain text:
+    #   A: "RDDT · Reddit, Inc.   Signal Confluence: Moderate"
+    #   B: "META · Meta Platforms   HIGH PRIORITY   Signal Confluence: Weak"
+    line1 = _txt(ps[0])
+    ticker, rest = "", line1
+    if "·" in line1:                                        # middot separator
+        ticker, rest = (x.strip() for x in line1.split("·", 1))
+    mp = _PRIORITY_RE.search(rest)
+    priority = f"{mp.group(1).upper()} PRIORITY" if mp else ""
+    mt = _TIER_RE.search(rest)
+    tier = mt.group(1).capitalize() if mt else ""
+    # company = text after the middot, up to the FIRST of the priority marker or "Signal
+    # Confluence:" (so the priority text never leaks into the company name).
+    cut = len(rest)
+    for m in (mp, re.search(r"Signal\s+Confluence:", rest, re.I)):
+        if m:
+            cut = min(cut, m.start())
+    company = rest[:cut].strip(" ·-–— \t")
     _require(company, "an <div class='ncard'> has no company name — cannot guarantee coverage")
 
     fields = {"flow_read": "", "catalyst": "", "technical_level": "", "skew": "", "thesis": ""}
@@ -268,8 +284,8 @@ def _parse_card(card_html: str) -> Card:
 
     hay = (fields["flow_read"] + " " + fields["thesis"]).lower()
     direction = "call setup" if "call setup" in hay else "put setup" if "put setup" in hay else ""
-    return Card(company=company, ticker=ticker, tier=tier, direction=direction,
-                price_note=price_note, **fields)
+    return Card(company=company, ticker=ticker, tier=tier, priority=priority,
+                direction=direction, price_note=price_note, **fields)
 
 
 def _classify_dg(headers):
@@ -420,6 +436,9 @@ def _card_facts(card: Card) -> str:
     bits = []
     if card.price_note:
         bits.append(card.price_note)
+    conf = " ".join(x for x in (card.tier and f"{card.tier} signal confluence", card.priority) if x)
+    if conf:
+        bits.append(conf)
     if card.direction:
         bits.append(f"Direction: {card.direction}")
     for lbl, val in (("Flow read", card.flow_read), ("Catalyst", card.catalyst),
@@ -484,7 +503,8 @@ def build_outline(model: BriefModel, date_str: str, open_words: int, close_words
                 break
             full_n -= 1
         for c in ordered[:full_n]:
-            label = f"Watchlist name: {c.company} — flow read, catalyst, technical level, skew, ranked {c.tier or 'n/a'}"
+            rank = " / ".join(x for x in (c.tier, c.priority) if x) or "n/a"
+            label = f"Watchlist name: {c.company} — flow read, catalyst, technical level, skew, ranked {rank}"
             beats.append(Beat(f"card::{c.company}", label, _card_facts(c), CARD_FLOOR, CARD_TARGET, 1))
         overflow = ordered[full_n:]
         if overflow:
@@ -712,7 +732,31 @@ def audio_card(mp3_url: str) -> str:
     )
 
 
+def strip_audio_card(html: str) -> str:
+    """Remove an existing audio-player card (depth-aware) plus any wrapping kg-card comments,
+    so a regenerated card replaces the old one instead of stacking a second player."""
+    m = re.search(r'<div\b[^>]*id="' + re.escape(AUDIO_CARD_ID) + r'"[^>]*>', html)
+    if not m:
+        return html
+    start, depth = m.start(), 1
+    end = None
+    for mm in re.finditer(r"</?div\b[^>]*>", html[m.end():], re.I):
+        depth += 1 if not mm.group().startswith("</") else -1
+        if depth == 0:
+            end = m.end() + mm.end()
+            break
+    if end is None:                                   # unbalanced — leave untouched
+        return html
+    if re.search(r"<!--kg-card-begin: html-->\s*$", html[:start]):
+        start = re.search(r"<!--kg-card-begin: html-->\s*$", html[:start]).start()
+    mpost = re.match(r"\s*<!--kg-card-end: html-->", html[end:])
+    if mpost:
+        end += mpost.end()
+    return html[:start] + html[end:]
+
+
 def build_new_html(original_html, mp3_url, visibility):
+    original_html = strip_audio_card(original_html)      # replace-safe: drop any prior card first
     card = audio_card(mp3_url)
     if visibility == "public":
         return card + "\n" + original_html
@@ -741,36 +785,45 @@ def main() -> int:
     eleven_key  = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     voice_id    = (os.environ.get("ELEVENLABS_VOICE_ID") or "").strip()
     post_id     = (os.environ.get("POST_ID") or "").strip()
+    slug        = (os.environ.get("SLUG") or "").strip()
     dry_run     = (os.environ.get("DRY_RUN") or "false").lower() == "true"
+    regenerate  = (os.environ.get("REGENERATE") or "false").lower() == "true"
 
-    missing = [k for k, v in {
+    base_missing = [k for k, v in {
         "GHOST_ADMIN_API_URL": api_url, "GHOST_ADMIN_API_KEY": admin_key,
         "ANTHROPIC_API_KEY": anthropic, "ELEVENLABS_API_KEY": eleven_key,
-        "ELEVENLABS_VOICE_ID": voice_id, "POST_ID": post_id}.items() if not v]
-    if missing:
-        print(f"::error::missing required env/inputs: {', '.join(missing)}")
+        "ELEVENLABS_VOICE_ID": voice_id}.items() if not v]
+    if base_missing:
+        print(f"::error::missing required secrets: {', '.join(base_missing)}")
+        return 1
+    if not (post_id or slug):
+        print("::error::provide either POST_ID or SLUG")
         return 1
 
     os.makedirs("out", exist_ok=True)
 
+    ident = slug or post_id
     try:
-        post = get_post(api_url, admin_key, post_id)
+        post = get_post(api_url, admin_key, post_id=post_id or None, slug=slug or None)
     except urllib.error.HTTPError as e:
-        print(f"::error::could not fetch post {post_id} (HTTP {e.code}): {e.read().decode('utf-8','replace')[:400]}")
+        print(f"::error::could not fetch post {ident} (HTTP {e.code}): {e.read().decode('utf-8','replace')[:400]}")
         return 1
 
+    post_id = post.get("id") or post_id                 # canonical id (needed to patch when fetched by slug)
     html = post.get("html") or ""
     visibility = post.get("visibility") or "public"
     status = post.get("status") or "unknown"
-    print(f"post {post_id}: status={status}, visibility={visibility}, title={post.get('title')!r}")
+    print(f"post {post_id} ({post.get('slug')}): status={status}, visibility={visibility}, "
+          f"title={post.get('title')!r}{' [REGENERATE]' if regenerate else ''}")
 
     # dump raw brief HTML as an artifact so any parse failure is debuggable
     with open("out/brief_raw.html", "w", encoding="utf-8") as f:
         f.write(html)
 
-    # already carries the Ghost audio card: player in place, nothing to do
-    if f'id="{AUDIO_CARD_ID}"' in html:
-        print("audio card already present on Ghost — nothing to do.")
+    # already carries the Ghost audio card: normally a no-op. In REGENERATE mode we rebuild
+    # and the old card is replaced (build_new_html strips it) so the backfill can refresh audio.
+    if f'id="{AUDIO_CARD_ID}"' in html and not regenerate:
+        print("audio card already present on Ghost — nothing to do (pass regenerate=true to refresh).")
         return 0
 
     if status != "published":
@@ -828,7 +881,7 @@ def main() -> int:
         if e.code == 409:   # someone edited the post since our fetch — re-read and retry once
             print("::warning::update collision (409) — re-fetching and retrying once ...")
             fresh = get_post(api_url, admin_key, post_id)
-            if f'id="{AUDIO_CARD_ID}"' in (fresh.get("html") or ""):
+            if f'id="{AUDIO_CARD_ID}"' in (fresh.get("html") or "") and not regenerate:
                 print("audio card appeared in the meantime — skip."); return 0
             new_html = build_new_html(fresh.get("html") or "", mp3_url, fresh.get("visibility") or "public")
             patch_post(api_url, admin_key, post_id, fresh["updated_at"], new_html)
