@@ -331,15 +331,22 @@ def parse_brief(html: str, date_iso: str) -> BriefModel:
         seg_body = re.sub(r"^.*?</div>", "", seg, count=1, flags=re.S)
         sections[title] = _txt(seg_body)
 
-    # watchlist cards OR the no-card note
+    # watchlist cards OR the no-card note. No-card days come in two shapes: an explicit
+    # <div class="nocard"> (some editions) OR just prose in the Watchlist section that says
+    # "No directional watchlist cards today." (the common weekday case). Handle both; only
+    # a brief with neither cards nor a Watchlist section is treated as malformed.
     cards, nocard_note = [], ""
     ncards = _blocks(body, "ncard")
     if ncards:
         cards = [_parse_card(c) for c in ncards]
     else:
         nc = _blocks(body, "nocard")
-        _require(nc, "no <div class='ncard'> cards and no <div class='nocard'> note — ambiguous brief")
-        nocard_note = _txt(nc[0])
+        if nc:
+            nocard_note = _txt(nc[0])
+        else:
+            nocard_note = _section(sections, "watchlist", "signal confluence")
+            _require(nocard_note,
+                     "no <div class='ncard'> cards, no <div class='nocard'>, and no Watchlist section")
 
     # data grids: classified by header labels (robust across `dg gate` and bare `dg`)
     tables = {}
