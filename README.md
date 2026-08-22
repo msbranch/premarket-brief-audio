@@ -24,14 +24,19 @@ the audio on a post that already has a player — it replaces the old card rathe
 5. **Asserts coverage** (code): verbatim open/close, every watchlist name spoken, no raw
    tickers/symbols, under the word cap, no dropped section. On failure it re-rolls the call;
    a cut-off or incomplete script never reaches a live post.
-6. Synthesizes an MP3 (ElevenLabs), uploads it to Ghost's media store, and patches the post
-   with the audio player. On paid posts the player sits **inside** the paywalled region (same
-   access as the brief), so it's members-only. On public posts it's at the top for everyone.
+6. Synthesizes an MP3 (ElevenLabs, with retry/backoff on the 429 concurrency cap), uploads it
+   to Ghost's media store, and **fills the player's `src` in place**. The brief already ships
+   its own editorial player — the scoped `.trd .audio.reveal` block with an empty `src=""` — so
+   this run only fills that src; it never injects its own player and never restyles anything.
+   That keeps the audio post visually identical to the written brief, with exactly one player.
+   If the template player isn't found, the run **fails loudly** rather than injecting a fallback
+   (it means the post wasn't built from the current template, and we want to know).
 
 The audio lives only on the Ghost site.
 
-Ghost-idempotent — if the post already has the player, the run is a no-op, so re-running a
-post is safe. Every run also saves the raw brief HTML to the `out/` artifact for debugging.
+Idempotent — if the player's `src` is already filled, the run is a no-op, so re-running is safe;
+pass `regenerate` to refresh it with a new MP3. Every run also saves the raw brief HTML to the
+`out/` artifact for debugging.
 
 ## Required secrets (Settings → Secrets and variables → Actions)
 | Secret | Value |

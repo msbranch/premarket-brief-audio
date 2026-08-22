@@ -50,7 +50,15 @@ NARRATION_MAX_ATTEMPTS = 6        # re-rolls on truncation OR coverage-assertion
 NARRATION_MAX_TOKENS   = 8192     # room for the model's thinking AND a full ~1250-word script;
                                   # at 4096 a long think can consume the whole budget and truncate
                                   # (or emit thinking only, zero script), wasting a retry.
-AUDIO_CARD_ID     = "tape-read-audio"   # idempotency sentinel
+# The brief ships its own editorial player inside the scoped .trd card, with an empty src="".
+# Our only job is to fill that src in place — never inject a player, never restyle. This regex
+# captures (prefix up to src="), (current src), (closing "). Anchored on the .trd .audio.reveal
+# block so it can't match some unrelated <audio> elsewhere on the page.
+AUDIO_PLAYER_RE = re.compile(
+    r'(<div class="audio reveal">\s*<span[^>]*>.*?</span>\s*<audio[^>]*>\s*<source[^>]*src=")'
+    r'([^"]*)'
+    r'(")',
+    re.S)
 
 # Outline budgeting (words). Live data: a dense Tape Read brief's natural spoken length is
 # ~1150-1250 (the previous pipeline shipped 1180-1245), so the cap is 1250. The model narrates
@@ -698,25 +706,49 @@ def assert_coverage(script: str, outline: Outline, model: BriefModel):
 
 
 # --- step 6: spoken script -> MP3 (ElevenLabs) ----------------------------
+TTS_MAX_ATTEMPTS = 6      # transient-error retries (429 concurrency/rate limit, 5xx)
+TTS_RETRY_CODES  = {429, 500, 502, 503, 504}
+
+
 def synthesize(eleven_key, voice_id, script):
     if len(script) > MAX_TTS_CHARS:
         raise RuntimeError(f"script is {len(script)} chars, over the {MAX_TTS_CHARS} single-request cap")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format={ELEVEN_OUTPUT_FMT}"
     body = json.dumps({"text": script, "model_id": ELEVENLABS_MODEL, "voice_settings": VOICE_SETTINGS}).encode()
-    r = urllib.request.Request(url, data=body, method="POST", headers={
-        "xi-api-key": eleven_key, "Content-Type": "application/json", "Accept": "audio/mpeg"})
-    try:
-        with urllib.request.urlopen(r, timeout=300) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        # ElevenLabs returns the real reason in the JSON body (invalid_api_key, quota_exceeded,
-        # detected_unusual_activity). The bare "HTTP 401" hides it — surface the body.
-        detail = ""
+    for attempt in range(1, TTS_MAX_ATTEMPTS + 1):
+        r = urllib.request.Request(url, data=body, method="POST", headers={
+            "xi-api-key": eleven_key, "Content-Type": "application/json", "Accept": "audio/mpeg"})
         try:
-            detail = e.read().decode("utf-8", "replace")[:800]
-        except Exception:
-            pass
-        raise RuntimeError(f"ElevenLabs TTS failed: HTTP {e.code} {e.reason} — {detail}") from None
+            with urllib.request.urlopen(r, timeout=300) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            # ElevenLabs returns the real reason in the JSON body (invalid_api_key, quota_exceeded,
+            # detected_unusual_activity). The bare "HTTP 401" hides it — surface the body.
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:800]
+            except Exception:
+                pass
+            # Transient errors — the 5-concurrent-request subscription cap (429
+            # concurrent_limit_exceeded) and 5xx — clear on their own, so back off and retry
+            # instead of failing the run. Exponential: 4, 8, 16, 32, 60s.
+            if e.code in TTS_RETRY_CODES and attempt < TTS_MAX_ATTEMPTS:
+                wait = min(2 ** (attempt + 1), 60)
+                print(f"::warning::ElevenLabs HTTP {e.code} (attempt {attempt}/{TTS_MAX_ATTEMPTS}) — "
+                      f"retrying in {wait}s ... {detail[:200]}")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"ElevenLabs TTS failed: HTTP {e.code} {e.reason} — {detail}") from None
+        except urllib.error.URLError as e:
+            # network blip / timeout — also transient
+            if attempt < TTS_MAX_ATTEMPTS:
+                wait = min(2 ** (attempt + 1), 60)
+                print(f"::warning::ElevenLabs connection error (attempt {attempt}/{TTS_MAX_ATTEMPTS}) — "
+                      f"retrying in {wait}s ... {e.reason}")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"ElevenLabs TTS failed: connection error — {e.reason}") from None
+    raise RuntimeError(f"ElevenLabs TTS failed: exhausted {TTS_MAX_ATTEMPTS} attempts")
 
 
 # --- step 7: MP3 -> Ghost media store -> public URL -----------------------
@@ -737,52 +769,24 @@ def upload_media(api_url, admin_key, mp3_bytes, filename):
         return json.loads(resp.read().decode("utf-8"))["media"][0]["url"]
 
 
-def audio_card(mp3_url: str) -> str:
-    return (
-        '<!--kg-card-begin: html-->\n'
-        f'<div id="{AUDIO_CARD_ID}" style="margin:0 0 20px;padding:14px 16px;background:#DBECFF;'
-        'border:1px solid #b9d4f0;border-radius:10px;font-family:-apple-system,Segoe UI,Arial,sans-serif;">'
-        '<div style="font-size:13px;font-weight:700;color:#16161a;margin:0 0 8px;">🎧 Listen to today\'s brief</div>'
-        f'<audio controls preload="none" style="width:100%;"><source src="{mp3_url}" type="audio/mpeg">'
-        'Your browser does not support the audio element.</audio></div>\n'
-        '<!--kg-card-end: html-->'
-    )
+def audio_src_state(html: str):
+    """(found, current_src): does the brief's shipped editorial player exist, and is its src
+    already filled? found=False means the post was NOT built from the current .trd template."""
+    m = AUDIO_PLAYER_RE.search(html)
+    return (True, m.group(2)) if m else (False, None)
 
 
-def strip_audio_card(html: str) -> str:
-    """Remove an existing audio-player card (depth-aware) plus any wrapping kg-card comments,
-    so a regenerated card replaces the old one instead of stacking a second player."""
-    m = re.search(r'<div\b[^>]*id="' + re.escape(AUDIO_CARD_ID) + r'"[^>]*>', html)
-    if not m:
-        return html
-    start, depth = m.start(), 1
-    end = None
-    for mm in re.finditer(r"</?div\b[^>]*>", html[m.end():], re.I):
-        depth += 1 if not mm.group().startswith("</") else -1
-        if depth == 0:
-            end = m.end() + mm.end()
-            break
-    if end is None:                                   # unbalanced — leave untouched
-        return html
-    if re.search(r"<!--kg-card-begin: html-->\s*$", html[:start]):
-        start = re.search(r"<!--kg-card-begin: html-->\s*$", html[:start]).start()
-    mpost = re.match(r"\s*<!--kg-card-end: html-->", html[end:])
-    if mpost:
-        end += mpost.end()
-    return html[:start] + html[end:]
-
-
-def build_new_html(original_html, mp3_url, visibility):
-    original_html = strip_audio_card(original_html)      # replace-safe: drop any prior card first
-    card = audio_card(mp3_url)
-    if visibility == "public":
-        return card + "\n" + original_html
-    marker = "<!--members-only-->"
-    idx = original_html.find(marker)
-    if idx != -1:
-        cut = idx + len(marker)
-        return original_html[:cut] + "\n" + card + "\n" + original_html[cut:]
-    return card + "\n" + original_html
+def fill_audio_src(html: str, mp3_url: str) -> str:
+    """Fill the empty src on the brief's shipped editorial player, in place — do NOT inject a
+    player and do NOT restyle. Exactly one player must be present (the brief ships one). If it
+    is not found, fail loudly rather than injecting a fallback: it means the post wasn't built
+    from the current template, and we want to know."""
+    new_html, n = AUDIO_PLAYER_RE.subn(lambda m: m.group(1) + mp3_url + m.group(3), html)
+    if n != 1:
+        raise RuntimeError(
+            f"editorial .trd .audio player not found (matched {n}, expected 1) — post not built "
+            "from the current template; failing loudly instead of injecting a fallback player.")
+    return new_html
 
 
 def patch_post(api_url, admin_key, post_id, updated_at, new_html):
@@ -837,10 +841,17 @@ def main() -> int:
     with open("out/brief_raw.html", "w", encoding="utf-8") as f:
         f.write(html)
 
-    # already carries the Ghost audio card: normally a no-op. In REGENERATE mode we rebuild
-    # and the old card is replaced (build_new_html strips it) so the backfill can refresh audio.
-    if f'id="{AUDIO_CARD_ID}"' in html and not regenerate:
-        print("audio card already present on Ghost — nothing to do (pass regenerate=true to refresh).")
+    # The brief ships its own editorial player inside .trd with an empty src. Fail loudly up
+    # front (before spending on narration/TTS) if it isn't there — that means the post wasn't
+    # built from the current template. If the src is already filled, it's a no-op unless
+    # REGENERATE is set (backfill / refresh).
+    found, cur_src = audio_src_state(html)
+    if not found:
+        print("::error::editorial .trd .audio player not found on this post — it wasn't built "
+              "from the current brief template. Failing loudly; not injecting a fallback player.")
+        return 1
+    if (cur_src or "").strip() and not regenerate:
+        print("audio src already filled on Ghost — nothing to do (pass regenerate=true to refresh).")
         return 0
 
     if status != "published":
@@ -894,22 +905,24 @@ def main() -> int:
     mp3_url = upload_media(api_url, admin_key, mp3, fname)
     print(f"hosted at: {mp3_url}")
 
-    new_html = build_new_html(html, mp3_url, visibility)
+    new_html = fill_audio_src(html, mp3_url)
     try:
         patch_post(api_url, admin_key, post_id, post["updated_at"], new_html)
     except urllib.error.HTTPError as e:
         if e.code == 409:   # someone edited the post since our fetch — re-read and retry once
             print("::warning::update collision (409) — re-fetching and retrying once ...")
             fresh = get_post(api_url, admin_key, post_id)
-            if f'id="{AUDIO_CARD_ID}"' in (fresh.get("html") or "") and not regenerate:
-                print("audio card appeared in the meantime — skip."); return 0
-            new_html = build_new_html(fresh.get("html") or "", mp3_url, fresh.get("visibility") or "public")
+            fresh_html = fresh.get("html") or ""
+            _, fresh_src = audio_src_state(fresh_html)
+            if (fresh_src or "").strip() and not regenerate:
+                print("audio src filled in the meantime — skip."); return 0
+            new_html = fill_audio_src(fresh_html, mp3_url)
             patch_post(api_url, admin_key, post_id, fresh["updated_at"], new_html)
         else:
             print(f"::error::patch failed (HTTP {e.code}): {e.read().decode('utf-8','replace')[:400]}")
             return 1
 
-    print(f"OK — audio player attached to post {post_id} ({visibility}).")
+    print(f"OK — audio src filled on post {post_id} ({visibility}).")
     return 0
 
 
