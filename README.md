@@ -12,17 +12,25 @@ Tick `dry_run` to generate the script + MP3 as a downloadable artifact without p
 ## What it does
 1. Fetches the published brief from Ghost via the **Admin API** (the Content API truncates
    paid/members-only bodies, so Admin is required).
-2. Converts the written brief into a ~3–4 minute spoken narration (Anthropic, Sonnet 5).
-3. Synthesizes an MP3 (ElevenLabs).
-4. Uploads the MP3 to Ghost's own media store → public CDN URL.
-5. Patches the post with the audio player. On paid posts the player sits **inside** the
-   paywalled region (same access as the brief), so it's members-only. On public posts it's
-   at the top for everyone.
+2. **Parses** the structured brief HTML into a model (deterministic, no LLM) — sections,
+   watchlist cards, and data tables, keyed off the brief's stable anchors. Fails loudly on a
+   malformed brief rather than narrating it.
+3. **Builds a beat-plan** (deterministic): a fixed set of beats, each with a word budget set
+   by floor/target/priority, so every watchlist name is guaranteed its own budgeted beat and
+   the shape is identical every session (~1,000 words, hard cap 1,050).
+4. **Narrates** the plan in one Anthropic call (Sonnet 5) — the model writes prose only; the
+   structure and coverage are already decided in code.
+5. **Asserts coverage** (code): verbatim open/close, every watchlist name spoken, no raw
+   tickers/symbols, under the word cap, no dropped section. On failure it re-rolls the call;
+   a cut-off or incomplete script never reaches a live post.
+6. Synthesizes an MP3 (ElevenLabs), uploads it to Ghost's media store, and patches the post
+   with the audio player. On paid posts the player sits **inside** the paywalled region (same
+   access as the brief), so it's members-only. On public posts it's at the top for everyone.
 
 The audio lives only on the Ghost site.
 
-Ghost-idempotent — if the post already has the player, the Ghost patch is skipped and the
-run is a no-op, so re-running a post is safe.
+Ghost-idempotent — if the post already has the player, the run is a no-op, so re-running a
+post is safe. Every run also saves the raw brief HTML to the `out/` artifact for debugging.
 
 ## Required secrets (Settings → Secrets and variables → Actions)
 | Secret | Value |

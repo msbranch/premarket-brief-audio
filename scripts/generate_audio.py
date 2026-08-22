@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Tape Read — audio pipeline.
+"""The Tape Read — audio pipeline (deterministic outline-driven narration).
 
 Standalone, runs AFTER a brief is manually published in Ghost. Triggered by
 workflow_dispatch with the published post's Ghost ID.
@@ -7,24 +7,35 @@ workflow_dispatch with the published post's Ghost ID.
 Sequence:
   1. Fetch the published brief from Ghost via the ADMIN API (the Content API
      truncates paid/members-only bodies, so Admin is required for Tue-Fri).
-  2. Convert the written brief -> spoken-word narration via the Anthropic API.
-  3. Synthesize an MP3 via ElevenLabs TTS.
-  4. Upload the MP3 to Ghost's own media store (/media/upload/) -> public CDN URL.
-  5. Patch the post with an audio player card. On PAID/members posts the card goes
-     INSIDE the gated region (just after the post's paywall divider, or at the top of
-     an already-fully-gated body) so the audio is members-only — same access as the
-     brief. On public posts it's simply prepended.
+  2. PARSE the structured brief HTML -> BriefModel (deterministic, no LLM). The
+     structure decisions (which section, which watchlist name, which table) are made
+     here in code, keyed off the brief's stable HTML anchors — the model never has to
+     find structure. Fails loudly if a required anchor is missing.
+  3. BUILD a beat-plan Outline (deterministic): a fixed set of beats, each with a word
+     budget, filled by floor/target/priority so every watchlist name is guaranteed its
+     own budgeted beat and the shape is identical every session.
+  4. NARRATE the outline -> spoken script in ONE Anthropic call. The model does prose
+     only: it narrates to the plan, hits the budgets, keeps the audio-native/compliance
+     rules. Retries on truncation OR coverage failure (below).
+  5. ASSERT coverage (code): every watchlist name spoken, verbatim open/close, no raw
+     tickers/symbols/table debris, under the word cap, each always-present beat left a
+     trace. On failure, re-roll the narration call. A cut-off or incomplete script never
+     reaches a live post.
+  6. Synthesize an MP3 via ElevenLabs TTS (single-request char cap enforced).
+  7. Upload the MP3 to Ghost's media store -> public CDN URL, and patch the post with an
+     audio player card. On PAID posts the card goes INSIDE the gated region (members-only,
+     same access as the brief); on public posts it's prepended.
 
 The audio lives only on the Ghost site.
 
 Ghost-idempotent: if the post already carries the audio card (id="tape-read-audio"),
-the Ghost upload/patch is skipped — the player is already in place, so there is nothing
-to do.
+the run is a no-op — the player is already in place.
 
 Stdlib only — no pip installs.
 """
 
 import os, sys, re, json, time, hmac, hashlib, base64, html as htmllib, datetime, zoneinfo
+from dataclasses import dataclass
 import urllib.request, urllib.error
 
 ET = zoneinfo.ZoneInfo("America/New_York")
@@ -35,41 +46,93 @@ ANTHROPIC_VERSION = "2023-06-01"
 ELEVENLABS_MODEL  = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 ELEVEN_OUTPUT_FMT = "mp3_44100_128"
 MAX_TTS_CHARS     = 9500          # eleven_multilingual_v2 caps ~10k chars/request
-SCRIPT_MAX_ATTEMPTS = 3           # retries when the model overruns max_tokens (non-deterministic runaway)
+NARRATION_MAX_ATTEMPTS = 3        # re-rolls on truncation OR coverage-assertion failure
 AUDIO_CARD_ID     = "tape-read-audio"   # idempotency sentinel
+
+# Outline budgeting (words).
+FILL_TARGET   = 1000              # fill toward ~1000; HARD_CAP is the assert ceiling
+HARD_CAP      = 1050
+CARD_FLOOR, CARD_TARGET = 90, 125
+COMPRESSED_PER_NAME = 22          # overflow cards -> one rapid-fire beat, ~a line each
+
+# Verbatim fixed lines — SINGLE source of truth, used both in the prompt and to reserve
+# their exact word count in the budget. Preserve the shipped branding; do not reword
+# without an explicit request.
+OPEN_SENTENCE  = "This is The Tape Read. Pre-market intelligence brief for {date}."
+CLOSE_SENTENCE = "That's the tape for {date}. Educational and observational only — not investment advice."
 
 # ElevenLabs voice character; tune once a voice is chosen.
 VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
 
-SCRIPT_SYSTEM = """You convert a written pre-market options-trading brief into a spoken-word \
-narration for an audio version subscribers listen to on the go. This is "The Tape Read."
+# Context beats: (key, floor, target, priority). Watchlist names are priority 1 and are
+# added dynamically (one beat per name). No-card day swaps the per-name beats for the
+# no-card explainer. This table is the whole beat-plan spec.
+CONTEXT_BEATS = [
+    ("tape_thesis",           40,  70, 3),
+    ("macro_loop",            60, 150, 2),
+    ("sector_gate",           35,  80, 3),
+    ("rate_context",          40,  90, 3),
+    ("flow_standouts",        60, 110, 2),
+    ("earnings_iv",           50,  85, 3),
+    ("macro_options_bridge",  45,  85, 3),
+    ("scorecard",             40,  60, 3),
+    ("next_session",          40,  65, 4),
+]
+NOCARD_BEAT = ("nocard_explainer", 60, 90, 2)
 
-Output ONLY the narration text to be read aloud — no preamble, no markdown, no headings, no \
-stage directions, no quotation marks around the whole thing.
+BEAT_LABEL = {
+    "tape_thesis":          "Today's Tape — the one-line thesis and what's driving the session",
+    "macro_loop":           "Macro backdrop and loop-closure — what data printed and the read-through",
+    "sector_gate":          "Sector gate — the spoken verdict on whether conditions are risk-on",
+    "rate_context":         "Rates and macro context",
+    "flow_standouts":       "Standout options-flow sweeps, told as prose (never a table of strikes)",
+    "earnings_iv":          "Key earnings this week and the implied-move reads",
+    "macro_options_bridge": "How the macro read translates into options positioning",
+    "scorecard":            "The scorecard — how recent calls graded out",
+    "next_session":         "Setup into the next session",
+    "nocard_explainer":     "Why there are no watchlist names today",
+}
 
-HARD RULES:
-- Open with EXACTLY this sentence, verbatim: "This is The Tape Read. Pre-market intelligence brief for {date}."
-- Audio-native prose: NO tables, NO symbols, NO HTML, NO bullet points, NO ticker symbols in raw form. \
-Say company names ("Robinhood," "Nvidia," "the semiconductor complex"), and speak numbers the way a person \
-would ("up about four and a quarter percent," "a put/call ratio near point four," "roughly twenty-three \
-million dollars of net call premium"). Spell out abbreviations.
-- Spell EVERY ticker as its company name, EVERYWHERE including the scorecard and flow sections — "SpaceX" not \
-"SPCX," "Robinhood" not "HOOD." Never voice a raw ticker as letters.
-- LENGTH IS A HARD CAP: 1050 words MAXIMUM, about six to seven minutes spoken. This cap is absolute and \
-OVERRIDES completeness — when the brief is long or dense, be more selective and compress; never run over. \
-Within that budget make it the FULLER companion to the written brief, not a teaser.
-- COVERAGE: give EACH watchlist name its full reasoning — the flow read, what the skew says, the technical \
-level, the catalyst status, and why it's capped where it is. Also carry: the macro loop-closure (what data \
-printed and the read-through), the sector-gate logic with the skew read, the standout options-flow sweeps as \
-PROSE (e.g. "a large long-dated call sweep in Bank of America" — never a table of strikes), the week's key \
-earnings, and the full scorecard. Narrate the numbers that carry the story; still NEVER read tables, raw \
-strikes, or every figure — summarize density, but do not drop whole sections. If the brief is dense (many \
-names), do NOT give every name equal airtime: cover the standouts in full and compress the rest to a line \
-each, so the whole narration stays within the word cap above.
-- EDUCATIONAL AND OBSERVATIONAL ONLY. Never say buy, sell, enter, take, add, or recommend. Describe what the \
-flow, the skew, and the setup show; never direct the listener to act. This is a hard compliance rule.
-- Confident, plain, conversational — a desk analyst walking someone through the open, not a robot reading a report.
-- Close with: "That's the tape for {date}. Educational and observational only — not investment advice."
+# Per-beat coverage backstop: an always-present beat passes if ANY of its anchor
+# substrings appears in the narration. A whole dropped section therefore triggers a
+# re-roll. Kept small/high-signal to avoid false re-rolls; only these six are checked.
+BEAT_ANCHORS = {
+    "sector_gate":          ["gate", "sector", "risk-on", "risk-off", "green light",
+                             "constructive", "cautious", "defensive"],
+    "rate_context":         ["yield", "rate", "basis point", "treasury", "fed",
+                             "two-year", "ten-year", "bond"],
+    "flow_standouts":       ["sweep", "premium", "flow", "calls", "puts", "block", "unusual"],
+    "earnings_iv":          ["earnings", "report", "implied move", "after the close",
+                             "before the open", "guidance"],
+    "macro_options_bridge": ["positioning", "into the open", "translate", "lean",
+                             "tilt", "setup"],
+    "scorecard":            ["record", "hit rate", "graded", "closed", "called",
+                             "batting", "went ", "scorecard", "track record"],
+}
+
+
+NARRATION_SYSTEM = """You are the voice of "The Tape Read," a pre-market options-flow brief.
+You will receive an OUTLINE: an ordered list of beats, each with a word budget and the facts to cover.
+Narrate the whole outline as ONE flowing spoken piece — a desk analyst walking someone through the open.
+
+FOLLOW THE PLAN:
+- Cover the beats in the given order. Aim for each beat's word budget (within about 15%); the totals fit the runtime.
+- Use ONLY the facts provided in each beat. Do not invent numbers, names, or catalysts.
+- Do NOT announce structure ("Section 4", "next beat", "the scorecard section"); just speak, with natural transitions.
+
+AUDIO-NATIVE:
+- No tables, symbols, HTML, bullet points, or raw ticker symbols. Say company names ("Robinhood," "Nvidia,"
+  "the semiconductor complex"), NEVER the ticker letters. Speak numbers the way a person would
+  ("up about eleven and a half percent," "a put/call ratio near one point four," "an IV rank around five").
+- Spell out abbreviations. Never read strikes or tables verbatim — narrate the story the numbers tell.
+
+FIXED LINES (verbatim, exactly):
+- FIRST sentence: "{open}"
+- LAST sentence: "{close}"
+
+COMPLIANCE — this is a hard rule:
+- EDUCATIONAL AND OBSERVATIONAL ONLY. Never say buy, sell, enter, add, take, or recommend. Describe what the
+  flow, the skew, and the setup show; never direct the listener to act.
 - Never mention HTML, tables, the website, the production process, or that you are an AI."""
 
 
@@ -99,61 +162,452 @@ def req_json(method, url, headers, body=None, timeout=120):
 
 # --- step 1: fetch the published brief (Admin API) ------------------------
 def get_post(api_url, admin_key, post_id):
-    url = f"{api_url}/ghost/api/admin/posts/{post_id}/?formats=html&include=tags"
+    url = f"{api_url}/ghost/api/admin/posts/{post_id}/?formats=html"
     hdr = {"Authorization": f"Ghost {make_jwt(admin_key)}", "Accept-Version": "v5.0"}
     return req_json("GET", url, hdr)["posts"][0]
 
 
-def html_to_text(html: str) -> str:
-    html = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)          # drop kg-card comments
-    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r"</(p|div|tr|li|h[1-6]|table)>", "\n", html, flags=re.IGNORECASE)
-    html = re.sub(r"<[^>]+>", " ", html)
-    text = htmllib.unescape(html)
-    text = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines())
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+# --- step 2: parse the structured brief -> BriefModel ---------------------
+class BriefParseError(RuntimeError):
+    """Raised when a required structural anchor is missing — never narrate a malformed brief."""
 
 
-# --- step 2: written brief -> spoken script (Anthropic) -------------------
-def generate_script(anthropic_key, brief_text, date_str):
+@dataclass
+class Card:
+    company: str
+    ticker: str = ""
+    tier: str = ""            # "Strong" / "Moderate" / "Weak" (from "Signal Confluence: X")
+    direction: str = ""       # derived from thesis/flow ("call setup" / "put setup" / "")
+    price_note: str = ""      # the gap/price context that precedes the Flow Read label
+    flow_read: str = ""
+    catalyst: str = ""
+    technical_level: str = ""
+    skew: str = ""
+    thesis: str = ""
+
+
+@dataclass
+class BriefModel:
+    date_iso: str
+    thesis: str
+    snapshot: list                    # header "snap" rows as "label: value" strings
+    sections: dict                    # {section_title: raw_text} in document order
+    cards: list                       # [Card, ...]  (empty on a no-card day)
+    nocard_note: str                  # <div class="nocard"> text when cards == []
+    tables: dict                      # {"gate"|"flow"|"net_premium"|"earnings": {"headers","rows"}}
+
+
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _txt(fragment: str) -> str:
+    return re.sub(r"\s+", " ", htmllib.unescape(_TAG.sub(" ", fragment))).strip()
+
+
+def _require(cond, msg):
+    if not cond:
+        raise BriefParseError(msg)
+
+
+def _blocks(html: str, cls: str):
+    """Depth-aware grab of every <div class="... cls ...">…</div> block (handles nesting)."""
+    out = []
+    pat = re.compile(r'<div[^>]*class="[^"]*\b' + re.escape(cls) + r'\b[^"]*"[^>]*>', re.I)
+    for m in pat.finditer(html):
+        depth, end = 1, m.end()
+        for mm in re.finditer(r"</?div\b", html[m.end():], re.I):
+            depth += 1 if mm.group()[1] != "/" else -1
+            if depth == 0:
+                end = m.end() + mm.start()
+                break
+        out.append(html[m.end():end])
+    return out
+
+
+def _parse_card(card_html: str) -> Card:
+    ps = re.findall(r"<p\b[^>]*>(.*?)</p>", card_html, re.I | re.S)
+    _require(ps, "an <div class='ncard'> has no <p> lines")
+
+    # line 1: identity ("TICKER · Company") + the .tier span ("Signal Confluence: X")
+    first = ps[0]
+    tier = ""
+    mt = re.search(r'<span[^>]*class="[^"]*\btier\b[^"]*"[^>]*>(.*?)</span>', first, re.I | re.S)
+    if mt:
+        tier = re.sub(r"(?i)^.*signal\s+confluence:\s*", "", _txt(mt.group(1))).strip()
+        identity = _txt(first[:mt.start()] + first[mt.end():])
+    else:
+        identity = _txt(first)
+    ticker, company = "", identity
+    if "·" in identity:                                   # middot separator
+        ticker, company = (x.strip() for x in identity.split("·", 1))
+    _require(company, "an <div class='ncard'> has no company name — cannot guarantee coverage")
+
+    fields = {"flow_read": "", "catalyst": "", "technical_level": "", "skew": "", "thesis": ""}
+    label_map = [("flow read", "flow_read"), ("catalyst", "catalyst"),
+                 ("technical", "technical_level"), ("skew", "skew"), ("thesis", "thesis")]
+    price_note = ""
+    for p in ps[1:]:
+        ms = re.search(r"<strong\b[^>]*>(.*?)</strong>(.*)", p, re.I | re.S)
+        if not ms:
+            continue
+        label, val = _txt(ms.group(1)).lower(), _txt(ms.group(2))
+        for key, fld in label_map:
+            if label.startswith(key):
+                fields[fld] = val
+                if fld == "flow_read":
+                    pre = _txt(p[:ms.start()])                  # gap/price context before "Flow Read:"
+                    if pre:
+                        price_note = pre
+                break
+
+    hay = (fields["flow_read"] + " " + fields["thesis"]).lower()
+    direction = "call setup" if "call setup" in hay else "put setup" if "put setup" in hay else ""
+    return Card(company=company, ticker=ticker, tier=tier, direction=direction,
+                price_note=price_note, **fields)
+
+
+def _classify_dg(headers):
+    H = " ".join(headers).lower()
+    if "gate result" in H or ("etf" in H and "pcr" in H):
+        return "gate"
+    if "contract" in H and "premium" in H:
+        return "flow"
+    if "net call" in H and "net put" in H:
+        return "net_premium"
+    if "eps" in H:
+        return "earnings"
+    return None
+
+
+def _parse_dg(dg_html):
+    headers = [_txt(m.group(1)) for m in
+               re.finditer(r'<div[^>]*class="[^"]*\bh\b[^"]*"[^>]*>(.*?)</div>', dg_html, re.I | re.S)]
+    cells = [_txt(m.group(1)) for m in
+             re.finditer(r'<div[^>]*class="[^"]*\bc\b[^"]*"[^>]*>(.*?)</div>', dg_html, re.I | re.S)]
+    n = len(headers)
+    rows = [cells[i:i + n] for i in range(0, len(cells), n)] if n else []
+    return headers, rows
+
+
+def parse_brief(html: str, date_iso: str) -> BriefModel:
+    root = _blocks(html, "trd")
+    _require(root, "missing <div class='trd'> brief card — is this the structured layout?")
+    body = root[0]
+
+    # thesis / Today's Tape
+    tape = _blocks(body, "tape")
+    _require(tape, "missing <div class='tape'> (Today's Tape / thesis)")
+    mth = re.search(r'<p[^>]*class="[^"]*\bthesis\b[^"]*"[^>]*>(.*?)</p>', tape[0], re.I | re.S)
+    _require(mth, "missing <p class='thesis'> inside .tape")
+    thesis = _txt(mth.group(1))
+
+    # header snapshot rows: .snap > .row > (.t label, .v value)
+    snapshot = []
+    snap = _blocks(body, "snap")
+    if snap:
+        for row in _blocks(snap[0], "row"):
+            t = re.search(r'class="[^"]*\bt\b[^"]*"[^>]*>(.*?)<', row, re.I | re.S)
+            v = re.search(r'class="[^"]*\bv\b[^"]*"[^>]*>(.*?)<', row, re.I | re.S)
+            label, value = (_txt(t.group(1)) if t else ""), (_txt(v.group(1)) if v else "")
+            if label or value:
+                snapshot.append(f"{label}: {value}".strip(": ").strip())
+
+    # sections, sliced by successive .sh anchors (8 numbered + Next-Session = 9)
+    anchors = [m.start() for m in re.finditer(r'<div[^>]*class="[^"]*\bsh\b', body, re.I)]
+    _require(len(anchors) >= 8, f"expected >=8 section headers (.sh), found {len(anchors)} — layout drift")
+    bounds = anchors + [len(body)]
+    sections = {}
+    for i in range(len(anchors)):
+        seg = body[anchors[i]:bounds[i + 1]]
+        mh = re.search(r"<h2[^>]*>(.*?)</h2>", seg, re.I | re.S)
+        title = _txt(mh.group(1)) if mh else f"section_{i + 1}"
+        # strip the leading section-header div (number + h2) so facts are body-only, not "02 Macro …"
+        seg_body = re.sub(r"^.*?</div>", "", seg, count=1, flags=re.S)
+        sections[title] = _txt(seg_body)
+
+    # watchlist cards OR the no-card note
+    cards, nocard_note = [], ""
+    ncards = _blocks(body, "ncard")
+    if ncards:
+        cards = [_parse_card(c) for c in ncards]
+    else:
+        nc = _blocks(body, "nocard")
+        _require(nc, "no <div class='ncard'> cards and no <div class='nocard'> note — ambiguous brief")
+        nocard_note = _txt(nc[0])
+
+    # data grids: classified by header labels (robust across `dg gate` and bare `dg`)
+    tables = {}
+    for dg in _blocks(body, "dg"):
+        headers, rows = _parse_dg(dg)
+        key = _classify_dg(headers)
+        if key and key not in tables:
+            tables[key] = {"headers": headers, "rows": rows}
+
+    return BriefModel(date_iso=date_iso, thesis=thesis, snapshot=snapshot, sections=sections,
+                      cards=cards, nocard_note=nocard_note, tables=tables)
+
+
+# --- step 3: build the beat-plan -> Outline -------------------------------
+@dataclass
+class Beat:
+    key: str
+    label: str
+    facts: str
+    floor: int
+    target: int
+    priority: int
+    budget: int = 0
+    flexible: bool = True
+
+
+@dataclass
+class Outline:
+    date_str: str
+    open_sentence: str
+    close_sentence: str
+    beats: list
+    total: int
+
+
+TIER_RANK = {"strong": 0, "moderate": 1, "weak": 2}
+
+_CORP_SUFFIX = re.compile(
+    r"(?i)\s*\b(corporation|corp|incorporated|inc|company|co|ltd|limited|plc|holdings|"
+    r"group|n\.?v|s\.?a|a\.?g|se)\.?$")
+
+
+def core_name(name: str) -> str:
+    """Reduce a legal name to what the narration actually says: 'Reddit, Inc.' -> 'Reddit',
+    'NVIDIA Corporation' -> 'NVIDIA'. Used for the spoken-name coverage check."""
+    core = name.split(",")[0].strip()
+    prev = None
+    while core and core != prev:            # strip stacked suffixes ("… Group Inc")
+        prev = core
+        core = _CORP_SUFFIX.sub("", core).strip()
+    return core or name.strip()
+
+
+def _section(sections, *keys):
+    for title, text in sections.items():
+        low = title.lower()
+        if any(k in low for k in keys):
+            return text
+    return ""
+
+
+def _table_facts(tables, key):
+    tbl = tables.get(key)
+    if not tbl:
+        return ""
+    rows = ["; ".join(f"{h}={c}" for h, c in zip(tbl["headers"], row)) for row in tbl["rows"]]
+    return " | ".join(rows)
+
+
+def _card_facts(card: Card) -> str:
+    bits = []
+    if card.price_note:
+        bits.append(card.price_note)
+    if card.direction:
+        bits.append(f"Direction: {card.direction}")
+    for lbl, val in (("Flow read", card.flow_read), ("Catalyst", card.catalyst),
+                     ("Technical", card.technical_level), ("Skew", card.skew), ("Thesis", card.thesis)):
+        if val:
+            bits.append(f"{lbl}: {val}")
+    return "\n".join(bits)
+
+
+def _context_facts(model: BriefModel) -> dict:
+    s, t = model.sections, model.tables
+    return {
+        "tape_thesis":          model.thesis,
+        "macro_loop":           _section(s, "macro") or " ".join(model.snapshot),
+        "sector_gate":          "\n".join(x for x in (_section(s, "gate", "sector"),
+                                                      _table_facts(t, "gate")) if x),
+        "rate_context":         _section(s, "rate", "yield"),
+        "flow_standouts":       "\n".join(x for x in (_section(s, "flow"),
+                                                      _table_facts(t, "flow"),
+                                                      _table_facts(t, "net_premium")) if x),
+        "earnings_iv":          "\n".join(x for x in (_section(s, "earning"),
+                                                      _table_facts(t, "earnings")) if x),
+        "macro_options_bridge": _section(s, "bridge", "positioning") or model.thesis,
+        "scorecard":            _section(s, "scorecard", "record", "grade"),
+        "next_session":         _section(s, "next"),
+        "nocard_explainer":     model.nocard_note,
+    }
+
+
+def build_outline(model: BriefModel, date_str: str, open_words: int, close_words: int) -> Outline:
+    facts = _context_facts(model)
+    no_card = not model.cards
+    remaining = FILL_TARGET - open_words - close_words
+
+    # assemble present context beats (drop any whose source facts are empty)
+    spec = list(CONTEXT_BEATS)
+    if no_card:
+        spec = spec[:1] + [NOCARD_BEAT] + spec[1:]          # thesis, no-card explainer, then rest
+    beats = []
+    for key, fl, tg, pr in spec:
+        f = (facts.get(key) or "").strip()
+        if not f:
+            continue
+        beats.append(Beat(key, BEAT_LABEL[key], f, fl, tg, pr))
+
+    # watchlist cards -> one full beat each, ranked Strong > Moderate > Weak then order.
+    # As many full cards as fit alongside context floors; overflow -> one rapid-fire beat.
+    if not no_card:
+        ranked = sorted(range(len(model.cards)),
+                        key=lambda i: (TIER_RANK.get(model.cards[i].tier.lower(), 3), i))
+        ordered = [model.cards[i] for i in ranked]
+        ctx_floor = sum(b.floor for b in beats)
+        n = len(ordered)
+        full_n = n
+        while full_n > 0:
+            need = ctx_floor + full_n * CARD_FLOOR + (n - full_n) * COMPRESSED_PER_NAME
+            if need <= remaining:
+                break
+            full_n -= 1
+        for c in ordered[:full_n]:
+            label = f"Watchlist name: {c.company} — flow read, catalyst, technical level, skew, ranked {c.tier or 'n/a'}"
+            beats.append(Beat(f"card::{c.company}", label, _card_facts(c), CARD_FLOOR, CARD_TARGET, 1))
+        overflow = ordered[full_n:]
+        if overflow:
+            names = ", ".join(c.company for c in overflow)
+            facts_txt = "\n".join(f"{c.company}: {c.direction or 'setup'} — "
+                                  f"{(c.thesis or c.flow_read or '')[:160]}" for c in overflow)
+            w = len(overflow) * COMPRESSED_PER_NAME
+            beats.append(Beat("cards_rapidfire",
+                              f"Rapid-fire — one line each for the remaining names: {names}",
+                              facts_txt, w, w, 1, flexible=False))
+
+    # fill: floors first, then distribute slack by priority (1->4), watchlist first,
+    # within a tier proportional to headroom, capping at target.
+    for b in beats:
+        b.budget = b.floor
+    slack = remaining - sum(b.floor for b in beats)
+    if slack > 0:
+        for pri in (1, 2, 3, 4):
+            while slack > 0:
+                head = [b for b in beats if b.priority == pri and b.flexible and b.budget < b.target]
+                if not head:
+                    break
+                room = sum(b.target - b.budget for b in head)
+                give = min(slack, room)
+                alloc = 0
+                for b in head:                       # proportional, floor-division
+                    add = min((give * (b.target - b.budget)) // room, b.target - b.budget)
+                    b.budget += add
+                    slack -= add
+                    alloc += add
+                if alloc == 0:                       # rounding stalled — guarantee progress
+                    b = max(head, key=lambda x: x.target - x.budget)
+                    b.budget += 1
+                    slack -= 1
+
+    total = open_words + close_words + sum(b.budget for b in beats)
+    return Outline(date_str=date_str,
+                   open_sentence=OPEN_SENTENCE.format(date=date_str),
+                   close_sentence=CLOSE_SENTENCE.format(date=date_str),
+                   beats=beats, total=total)
+
+
+def render_outline_for_model(outline: Outline) -> str:
+    lines = [f"OUTLINE for {outline.date_str}. Narrate to these beats and word budgets, in order.",
+             f'Open with exactly: "{outline.open_sentence}"', ""]
+    for b in outline.beats:
+        lines.append(f"[{b.label} — about {b.budget} words]")
+        lines.append(b.facts.strip())
+        lines.append("")
+    lines.append(f'Close with exactly: "{outline.close_sentence}"')
+    return "\n".join(lines)
+
+
+# --- step 4: narrate the outline (Anthropic), with coverage re-roll --------
+def generate_narration(anthropic_key, outline: Outline, model: BriefModel, date_str: str):
+    system = (NARRATION_SYSTEM
+              .replace("{open}", outline.open_sentence)
+              .replace("{close}", outline.close_sentence))
     body = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 4096,   # headroom for the ~1100-word target (spelling every ticker as a company
-                              # name runs longer) + the mandatory closing line. A completed script still
-                              # lands under the 9500-char TTS cap; the guard below backstops the rest.
-        "system": SCRIPT_SYSTEM.replace("{date}", date_str),
-        "messages": [{"role": "user", "content":
-            f"Here is today's written brief. Convert it into the spoken narration per the rules.\n\n{brief_text}"}],
+        "max_tokens": 4096,
+        "system": system,
+        "messages": [{"role": "user", "content": render_outline_for_model(outline)}],
     }
     hdr = {"x-api-key": anthropic_key, "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json"}
 
-    # The model occasionally ignores the length cap and runs to the max_tokens ceiling, which
-    # truncates the script mid-sentence (no closing line). Output is non-deterministic, so a fresh
-    # attempt almost always lands a properly-sized script — retry a few times before giving up
-    # rather than failing the whole run on a one-off runaway generation.
-    last_err = "unknown error"
-    for attempt in range(1, SCRIPT_MAX_ATTEMPTS + 1):
+    # The model can overrun max_tokens (truncated, mid-sentence) or drop a beat/name. Output
+    # is non-deterministic, so a fresh attempt almost always fixes it — re-roll a few times,
+    # then fail loudly rather than ship a cut-off or incomplete script to a live post.
+    last = "unknown error"
+    for attempt in range(1, NARRATION_MAX_ATTEMPTS + 1):
         data = req_json("POST", "https://api.anthropic.com/v1/messages", hdr, body)
         parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
         script = "".join(parts).strip()
         if not script:
-            last_err = "Anthropic returned an empty script"
+            last = "Anthropic returned an empty script"
         elif data.get("stop_reason") == "max_tokens":
-            last_err = "Anthropic hit max_tokens — script was truncated (model overran the length cap)"
+            last = "hit max_tokens — script truncated (model overran the length cap)"
         else:
-            return script
-        if attempt < SCRIPT_MAX_ATTEMPTS:
-            print(f"::warning::script attempt {attempt}/{SCRIPT_MAX_ATTEMPTS} failed ({last_err}); retrying ...")
+            ok, reasons = assert_coverage(script, outline, model)
+            if ok:
+                return script
+            last = "coverage failed — " + "; ".join(reasons)
+        if attempt < NARRATION_MAX_ATTEMPTS:
+            print(f"::warning::narration attempt {attempt}/{NARRATION_MAX_ATTEMPTS}: {last}; retrying ...")
 
-    # Fail loudly rather than synthesize a cut-off MP3 (and never patch a live post with it).
-    raise RuntimeError(f"{last_err}; exhausted {SCRIPT_MAX_ATTEMPTS} attempts — tighten the length target if this persists")
+    raise RuntimeError(f"{last}; exhausted {NARRATION_MAX_ATTEMPTS} attempts")
 
 
-# --- step 3: spoken script -> MP3 (ElevenLabs) ----------------------------
+# --- step 5: coverage assertion -------------------------------------------
+def assert_coverage(script: str, outline: Outline, model: BriefModel):
+    """Return (ok, reasons). Any reason is a hard fail -> re-roll."""
+    reasons = []
+    s = script.strip()
+    low = s.lower()
+
+    if not s.startswith(outline.open_sentence):
+        reasons.append("open line not verbatim")
+    if not s.endswith(outline.close_sentence):
+        reasons.append("close line missing or not final (script may be truncated)")
+
+    # every watchlist name must be spoken — a dropped name is a hard fail. Match the spoken
+    # core name ("Reddit"), not the legal name ("Reddit, Inc."), which narration never says.
+    for c in model.cards:
+        core = core_name(c.company).lower()
+        if core and core not in low and c.company.lower() not in low:
+            reasons.append(f"watchlist name dropped: {c.company}")
+
+    # no raw symbols or table debris in spoken prose
+    if "$" in s or "%" in s:
+        reasons.append("raw $ or % symbol present (numbers must be spoken as words)")
+    if re.search(r"\|\s*-{2,}|\bhttps?://", s):
+        reasons.append("table debris or URL present")
+
+    # no raw ticker letters voiced (card tickers + every table's first-column tk ticker)
+    raw = {c.ticker for c in model.cards if c.ticker}
+    for tbl in model.tables.values():
+        for row in tbl["rows"]:
+            if row and re.fullmatch(r"[A-Z]{1,6}", row[0]):
+                raw.add(row[0])
+    for t in sorted(raw):
+        if re.search(rf"\b{re.escape(t)}\b", s):               # case-sensitive: matches "SPY", not "spy"
+            reasons.append(f"raw ticker voiced: {t}")
+
+    # per-beat backstop: a whole dropped section (of the always-present six) triggers re-roll
+    present = {b.key for b in outline.beats}
+    for key, anchors in BEAT_ANCHORS.items():
+        if key in present and not any(a in low for a in anchors):
+            reasons.append(f"beat likely dropped: {key}")
+
+    wc = len(s.split())
+    if wc > HARD_CAP:
+        reasons.append(f"over word cap: {wc} > {HARD_CAP}")
+
+    return (not reasons), reasons
+
+
+# --- step 6: spoken script -> MP3 (ElevenLabs) ----------------------------
 def synthesize(eleven_key, voice_id, script):
     if len(script) > MAX_TTS_CHARS:
-        # Single-request cap. Keep the narration tight (the prompt targets ~600 words);
-        # if you move to long-form, chunk on sentence boundaries and concatenate the MP3s.
         raise RuntimeError(f"script is {len(script)} chars, over the {MAX_TTS_CHARS} single-request cap")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format={ELEVEN_OUTPUT_FMT}"
     body = json.dumps({"text": script, "model_id": ELEVENLABS_MODEL, "voice_settings": VOICE_SETTINGS}).encode()
@@ -163,9 +617,8 @@ def synthesize(eleven_key, voice_id, script):
         with urllib.request.urlopen(r, timeout=300) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
-        # ElevenLabs returns the real reason in the JSON body (e.g. invalid_api_key,
-        # quota_exceeded, or detected_unusual_activity which disables API access on some
-        # plans). The bare "HTTP 401" hides it — surface the body so the cause is actionable.
+        # ElevenLabs returns the real reason in the JSON body (invalid_api_key, quota_exceeded,
+        # detected_unusual_activity). The bare "HTTP 401" hides it — surface the body.
         detail = ""
         try:
             detail = e.read().decode("utf-8", "replace")[:800]
@@ -174,7 +627,7 @@ def synthesize(eleven_key, voice_id, script):
         raise RuntimeError(f"ElevenLabs TTS failed: HTTP {e.code} {e.reason} — {detail}") from None
 
 
-# --- step 4: MP3 -> Ghost media store -> public URL -----------------------
+# --- step 7: MP3 -> Ghost media store -> public URL -----------------------
 def upload_media(api_url, admin_key, mp3_bytes, filename):
     boundary = "----TapeRead" + base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
     b = boundary.encode()
@@ -192,7 +645,6 @@ def upload_media(api_url, admin_key, mp3_bytes, filename):
         return json.loads(resp.read().decode("utf-8"))["media"][0]["url"]
 
 
-# --- step 5: patch the post with the audio player -------------------------
 def audio_card(mp3_url: str) -> str:
     return (
         '<!--kg-card-begin: html-->\n'
@@ -208,11 +660,7 @@ def audio_card(mp3_url: str) -> str:
 def build_new_html(original_html, mp3_url, visibility):
     card = audio_card(mp3_url)
     if visibility == "public":
-        return card + "\n" + original_html                    # Monday: everything already public
-    # Paid/members: the audio is paid content too — same access as the brief, never in the public
-    # preview. If the post has a public-preview (paywall) divider, drop the card just AFTER it so it
-    # sits at the top of the gated region. Otherwise the whole paid body is already gated, so the card
-    # goes at the top and inherits that gating.
+        return card + "\n" + original_html
     marker = "<!--members-only-->"
     idx = original_html.find(marker)
     if idx != -1:
@@ -231,8 +679,7 @@ def patch_post(api_url, admin_key, post_id, updated_at, new_html):
 # --- main -----------------------------------------------------------------
 def main() -> int:
     # .strip() every credential: a trailing newline pasted into a GitHub secret would otherwise
-    # ride along in the auth header and surface as a spurious HTTP 401 (the key looks "active" in
-    # the provider dashboard, but the header value is malformed).
+    # ride along in the auth header and surface as a spurious HTTP 401.
     api_url     = (os.environ.get("GHOST_ADMIN_API_URL") or "").strip().rstrip("/")
     admin_key   = (os.environ.get("GHOST_ADMIN_API_KEY") or "").strip()
     anthropic   = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
@@ -262,13 +709,11 @@ def main() -> int:
     status = post.get("status") or "unknown"
     print(f"post {post_id}: status={status}, visibility={visibility}, title={post.get('title')!r}")
 
-    # date (ET) — used for the narration and the MP3 filename
-    pub = post.get("published_at") or datetime.datetime.now(ET).isoformat()
-    dt = datetime.datetime.fromisoformat(pub.replace("Z", "+00:00")).astimezone(ET)
-    date_str = dt.strftime("%A, %B %-d, %Y")
-    fname = f"tape-read-{dt.strftime('%Y%m%d')}.mp3"
+    # dump raw brief HTML as an artifact so any parse failure is debuggable
+    with open("out/brief_raw.html", "w", encoding="utf-8") as f:
+        f.write(html)
 
-    # Already carries the Ghost audio card: the player is in place, so there is nothing to do.
+    # already carries the Ghost audio card: player in place, nothing to do
     if f'id="{AUDIO_CARD_ID}"' in html:
         print("audio card already present on Ghost — nothing to do.")
         return 0
@@ -276,12 +721,36 @@ def main() -> int:
     if status != "published":
         print(f"::warning::post status is {status!r}, not 'published' — proceeding, but you normally trigger this after publishing.")
 
-    brief_text = html_to_text(html)
-    print(f"brief text: {len(brief_text)} chars -> generating script with {ANTHROPIC_MODEL} ...")
-    script = generate_script(anthropic, brief_text, date_str)
+    # date (ET) — narration + MP3 filename
+    pub = post.get("published_at") or datetime.datetime.now(ET).isoformat()
+    dt = datetime.datetime.fromisoformat(pub.replace("Z", "+00:00")).astimezone(ET)
+    date_str = dt.strftime("%A, %B %-d, %Y")
+    fname = f"tape-read-{dt.strftime('%Y%m%d')}.mp3"
+
+    # parse -> model (fail loud on malformed brief)
+    try:
+        model = parse_brief(html, dt.date().isoformat())
+    except BriefParseError as e:
+        print(f"::error::brief parse failed: {e}  (raw HTML saved to out/brief_raw.html)")
+        return 1
+    print(f"parsed: {len(model.cards)} watchlist card(s), {len(model.sections)} sections, "
+          f"tables={sorted(model.tables)}")
+    print(f"section titles: {list(model.sections)}")
+
+    # build outline (reserve open/close at their exact word count)
+    open_words = len(OPEN_SENTENCE.format(date=date_str).split())
+    close_words = len(CLOSE_SENTENCE.format(date=date_str).split())
+    outline = build_outline(model, date_str, open_words, close_words)
+    print(f"outline (~{outline.total} words, open {open_words} / close {close_words}):")
+    print(f"  {'open (verbatim)':32} {open_words:>4}")
+    for b in outline.beats:
+        print(f"  {b.key:32} {b.budget:>4}  (floor {b.floor}/tgt {b.target}, p{b.priority})")
+    print(f"  {'close (verbatim)':32} {close_words:>4}")
+
+    script = generate_narration(anthropic, outline, model, date_str)
     with open("out/script.txt", "w", encoding="utf-8") as f:
         f.write(script)
-    print(f"script: {len(script)} chars / ~{len(script.split())} words")
+    print(f"script: {len(script)} chars / ~{len(script.split())} words (coverage OK)")
 
     print(f"synthesizing MP3 with ElevenLabs ({ELEVENLABS_MODEL}) ...")
     mp3 = synthesize(eleven_key, voice_id, script)
