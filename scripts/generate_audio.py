@@ -46,7 +46,10 @@ ANTHROPIC_VERSION = "2023-06-01"
 ELEVENLABS_MODEL  = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 ELEVEN_OUTPUT_FMT = "mp3_44100_128"
 MAX_TTS_CHARS     = 9500          # eleven_multilingual_v2 caps ~10k chars/request
-NARRATION_MAX_ATTEMPTS = 4        # re-rolls on truncation OR coverage-assertion failure
+NARRATION_MAX_ATTEMPTS = 6        # re-rolls on truncation OR coverage-assertion failure
+NARRATION_MAX_TOKENS   = 8192     # room for the model's thinking AND a full ~1250-word script;
+                                  # at 4096 a long think can consume the whole budget and truncate
+                                  # (or emit thinking only, zero script), wasting a retry.
 AUDIO_CARD_ID     = "tape-read-audio"   # idempotency sentinel
 
 # Outline budgeting (words). Live data: a dense Tape Read brief's natural spoken length is
@@ -577,7 +580,7 @@ def generate_narration(anthropic_key, outline: Outline, model: BriefModel, date_
               .replace("{close}", outline.close_sentence))
     body = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 4096,
+        "max_tokens": NARRATION_MAX_TOKENS,
         "system": system,
         "messages": [{"role": "user", "content": render_outline_for_model(outline)}],
     }
