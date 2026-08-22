@@ -6,8 +6,6 @@
 #   ANTHROPIC_API_KEY         — Anthropic API key
 #   ELEVENLABS_API_KEY        — ElevenLabs API key
 #   ELEVENLABS_VOICE_ID       — ElevenLabs voice id
-#   TRANSISTOR_API_KEY        — Transistor.fm API key (Account settings → API Key)
-#   TRANSISTOR_SHOW_ID        — Transistor.fm show ID (numeric ID in dashboard URL)
 
 name: The Tape Read — Audio
 
@@ -52,32 +50,6 @@ jobs:
           ELEVENLABS_API_KEY:  ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
         run: python3 scripts/generate_audio.py
-
-      - name: Publish to Transistor.fm podcast feed
-        id: publish_transistor
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        env:
-          TRANSISTOR_API_KEY: ${{ secrets.TRANSISTOR_API_KEY }}
-          TRANSISTOR_SHOW_ID: ${{ secrets.TRANSISTOR_SHOW_ID }}
-        run: |
-          if [ ! -f out/episode_mp3_path.txt ]; then
-            echo "No episode metadata found (audio step produced no new MP3 — e.g. idempotent skip). Nothing to publish to Transistor."
-            exit 0
-          fi
-          pip install --quiet requests
-          python3 publish_to_transistor.py \
-            --audio-file "$(cat out/episode_mp3_path.txt)" \
-            --title "$(cat out/episode_title.txt)" \
-            --date "$(cat out/episode_date.txt)" \
-            --keywords "$(cat out/episode_keywords.txt)" \
-            --excerpt "$(cat out/episode_excerpt.txt)" \
-            --ghost-url "$(cat out/episode_url.txt)"
-
-      - name: Publish summary
-        if: ${{ steps.publish_transistor.outputs.transistor_share_url != '' }}
-        run: |
-          echo "- **Transistor episode published** ✓" >> $GITHUB_STEP_SUMMARY
-          echo "- **Transistor share URL:** ${{ steps.publish_transistor.outputs.transistor_share_url }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload script + MP3 artifact (dry-run / debugging)
         if: ${{ always() }}
