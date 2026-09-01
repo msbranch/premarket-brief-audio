@@ -74,6 +74,23 @@ COMPRESSED_PER_NAME = 22          # overflow cards -> one rapid-fire beat, ~a li
 OPEN_SENTENCE  = "This is The Tape Read. Pre-market intelligence brief for {date}."
 CLOSE_SENTENCE = "That's the tape for {date}. Educational and observational only — not investment advice."
 
+
+_ORDINAL_ONES = ["", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+                 "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth",
+                 "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth"]
+
+
+def spoken_date(dt) -> str:
+    """A speech-natural date: 'Tuesday, September first'. The bare numeric form ('September 1')
+    makes ElevenLabs say 'September one' instead of 'first', and the year adds a clunky
+    'twenty twenty-six' to the open — a host just says the weekday and date."""
+    d = dt.day
+    if d <= 20 or d == 30:
+        day = _ORDINAL_ONES[d] if d <= 20 else "thirtieth"
+    else:
+        day = "twenty-" + _ORDINAL_ONES[d - 20] if d < 30 else "thirty-" + _ORDINAL_ONES[d - 30]
+    return f"{dt.strftime('%A, %B')} {day}"
+
 # ElevenLabs voice character; tune once a voice is chosen.
 VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
 
@@ -860,7 +877,7 @@ def main() -> int:
     # date (ET) — narration + MP3 filename
     pub = post.get("published_at") or datetime.datetime.now(ET).isoformat()
     dt = datetime.datetime.fromisoformat(pub.replace("Z", "+00:00")).astimezone(ET)
-    date_str = dt.strftime("%A, %B %-d, %Y")
+    date_str = spoken_date(dt)                    # e.g. "Tuesday, September first" (TTS-natural)
     fname = f"tape-read-{dt.strftime('%Y%m%d')}.mp3"
 
     # parse -> model (fail loud on malformed brief)
