@@ -206,6 +206,38 @@ def req_json(method, url, headers, body=None, timeout=120):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def post_anthropic(hdr, body, max_retries=4):
+    """POST to Anthropic Messages with the error body surfaced and transient errors retried.
+    A bare urllib HTTPError hides the reason (a 400 in particular needs its body to diagnose),
+    and 429/5xx/overloaded are transient — back off and retry rather than failing the run."""
+    url = "https://api.anthropic.com/v1/messages"
+    for attempt in range(1, max_retries + 1):
+        try:
+            return req_json("POST", url, hdr, body)
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:800]
+            except Exception:
+                pass
+            if e.code in (429, 500, 502, 503, 504, 529) and attempt < max_retries:
+                wait = min(2 ** (attempt + 1), 30)
+                print(f"::warning::Anthropic HTTP {e.code} (attempt {attempt}/{max_retries}) — "
+                      f"retrying in {wait}s ... {detail[:200]}")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Anthropic Messages API failed: HTTP {e.code} {e.reason} — {detail}") from None
+        except urllib.error.URLError as e:
+            if attempt < max_retries:
+                wait = min(2 ** (attempt + 1), 30)
+                print(f"::warning::Anthropic connection error (attempt {attempt}/{max_retries}) — "
+                      f"retrying in {wait}s ... {e.reason}")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Anthropic Messages API failed: connection error — {e.reason}") from None
+    raise RuntimeError("Anthropic Messages API failed: exhausted retries")
+
+
 # --- step 1: fetch the published brief (Admin API) ------------------------
 def get_post(api_url, admin_key, post_id=None, slug=None):
     """Fetch by 24-hex post id, or by slug (…/posts/slug/<slug>/). One is required."""
@@ -619,7 +651,7 @@ def generate_narration(anthropic_key, outline: Outline, model: BriefModel, date_
     last = "unknown error"
     for attempt in range(1, NARRATION_MAX_ATTEMPTS + 1):
         body["messages"] = messages
-        data = req_json("POST", "https://api.anthropic.com/v1/messages", hdr, body)
+        data = post_anthropic(hdr, body)
         content = data.get("content", []) or []
         parts = [b.get("text", "") for b in content if b.get("type") == "text"]
         script = "".join(parts).strip()
